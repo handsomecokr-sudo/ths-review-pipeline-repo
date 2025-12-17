@@ -8,3 +8,4 @@ COPY main.py .
 
 ENV PORT=8080
 CMD ["functions-framework", "--target=ingest_from_gcs", "--port=8080"]
+ENV PYTHONUNBUFFERED=1
