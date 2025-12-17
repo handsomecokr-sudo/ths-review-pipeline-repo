@@ -1,2 +1,17 @@
+# Cloud Run + Eventarc CloudEvents handler
 functions-framework==3.*
 cloudevents==1.*
+
+# GCS / BigQuery clients
+google-cloud-storage>=2.16.0
+google-cloud-bigquery>=3.25.0
+
+# Excel parsing
+pandas>=2.2.0
+openpyxl>=3.1.2
+
+# (옵션) DLP 마스킹
+google-cloud-dlp>=3.18.0
+
+# (옵션) Vertex AI / Gemini (추후 LLM 호출/배치 제출용)
+google-genai>=1.0.0
