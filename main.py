@@ -7,10 +7,14 @@ from datetime import datetime, timezone
 import functions_framework
 import pandas as pd
 from cloudevents.http import CloudEvent
-import google.auth  # ✅ 추가
+import google.auth
 
 from google.cloud import bigquery
 from google.cloud import storage
+
+# google genai (Vertex AI)
+from google import genai
+from google.genai.types import CreateBatchJobConfig, HttpOptions
 
 # -----------------------------
 # Logging
@@ -22,7 +26,6 @@ logger = logging.getLogger("review-pipeline")
 # Config (Project ID 안전하게 가져오기)
 # -----------------------------
 def _get_project_id() -> str:
-    # 1) 환경변수 우선 (어떤 환경에서든 유연하게)
     env_pid = (
         os.getenv("GOOGLE_CLOUD_PROJECT")
         or os.getenv("GCP_PROJECT")
@@ -32,7 +35,6 @@ def _get_project_id() -> str:
     if env_pid:
         return env_pid
 
-    # 2) Cloud Run/ADC(Application Default Credentials)에서 project id 얻기
     _, pid = google.auth.default()
     if not pid:
         raise RuntimeError(
@@ -40,12 +42,21 @@ def _get_project_id() -> str:
         )
     return pid
 
-PROJECT_ID = _get_project_id()  # ✅ 교체
+PROJECT_ID = _get_project_id()
 DATASET = os.getenv("BQ_DATASET", "ths_review_analytics")
 
 TABLE_INGEST = f"{PROJECT_ID}.{DATASET}.ingestion_files"
 TABLE_RAW = f"{PROJECT_ID}.{DATASET}.reviews_raw"
 TABLE_CLEAN = f"{PROJECT_ID}.{DATASET}.reviews_clean"
+
+# Batch 관련
+VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "asia-northeast3")
+VERTEX_GEMINI_MODEL = os.getenv("VERTEX_GEMINI_MODEL", "gemini-2.5-flash-lite")
+
+# JSONL 저장 버킷/프리픽스
+BATCH_BUCKET = os.getenv("BATCH_BUCKET", "ths-review-upload-bkt")
+BATCH_INPUT_PREFIX = os.getenv("BATCH_INPUT_PREFIX", "batch_inputs")
+BATCH_OUTPUT_PREFIX = os.getenv("BATCH_OUTPUT_PREFIX", f"gs://{BATCH_BUCKET}/batch_outputs/")
 
 # 엑셀 헤더(한글) -> 표준 컬럼명(BQ)
 EXCEL_TO_STD = {
@@ -85,17 +96,15 @@ EXPECTED_STD_COLS = [
 def _bq() -> bigquery.Client:
     return bigquery.Client(project=PROJECT_ID)
 
-
 def _gcs() -> storage.Client:
     return storage.Client(project=PROJECT_ID)
-
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
 # -----------------------------
-# Ingestion idempotency
+# Ingestion idempotency / safety
 # -----------------------------
 def _already_done(bucket: str, object_name: str, generation: str) -> bool:
     client = _bq()
@@ -116,7 +125,6 @@ def _already_done(bucket: str, object_name: str, generation: str) -> bool:
     rows = list(client.query(sql, job_config=job_config).result())
     return bool(rows) and rows[0]["status"] == "DONE"
 
-
 def _mark_ingestion(status: str, bucket: str, object_name: str, generation: str, error_message: str = None):
     client = _bq()
     sql = f"""
@@ -135,6 +143,25 @@ def _mark_ingestion(status: str, bucket: str, object_name: str, generation: str,
     )
     client.query(sql, job_config=job_config).result()
 
+def _raw_already_loaded(bucket: str, object_name: str, generation: str) -> bool:
+    """재시도 시 reviews_raw 중복 append 방지용"""
+    client = _bq()
+    sql = f"""
+    SELECT 1
+    FROM `{TABLE_RAW}`
+    WHERE source_bucket=@bucket AND source_object=@object_name AND source_generation=@generation
+    LIMIT 1
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("bucket", "STRING", bucket),
+            bigquery.ScalarQueryParameter("object_name", "STRING", object_name),
+            bigquery.ScalarQueryParameter("generation", "STRING", generation),
+        ]
+    )
+    rows = list(client.query(sql, job_config=job_config).result())
+    return bool(rows)
+
 
 # -----------------------------
 # GCS + Excel load
@@ -146,19 +173,16 @@ def _download_xlsx(bucket: str, name: str) -> str:
     blob.download_to_filename(local_path)
     return local_path
 
-
 def _load_excel_mapped(path: str) -> pd.DataFrame:
     df = pd.read_excel(path, engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
 
-    # 한글 헤더 -> 표준 컬럼명
     df = df.rename(columns=EXCEL_TO_STD)
 
     missing = [c for c in EXPECTED_STD_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"컬럼 매핑 후 누락: {missing}. 현재 컬럼={list(df.columns)}")
 
-    # 표준 컬럼만 유지
     return df[EXPECTED_STD_COLS].copy()
 
 
@@ -204,7 +228,6 @@ def _append_reviews_raw(df_std: pd.DataFrame, bucket: str, name: str, generation
     job.result()
     logger.info("BQ append reviews_raw rows=%d ingest_id=%s", len(df_raw), ingest_id)
 
-
 def _merge_reviews_clean(df_std: pd.DataFrame):
     """
     reviews_clean은 타입 파싱(날짜/숫자) + review_key 생성 + MERGE upsert
@@ -213,8 +236,6 @@ def _merge_reviews_clean(df_std: pd.DataFrame):
     loaded_at = _now_utc()
 
     df = df_std.copy()
-
-    # 타입 파싱(안전)
     df["review_seq"] = pd.to_numeric(df["review_seq"], errors="coerce").fillna(0).astype(int)
     df["review_score"] = pd.to_numeric(df["review_score"], errors="coerce").fillna(0).astype(int)
     df["write_date"] = pd.to_datetime(df["write_date"], errors="coerce").dt.date
@@ -287,6 +308,159 @@ def _merge_reviews_clean(df_std: pd.DataFrame):
 
 
 # -----------------------------
+# Batch input(JSONL) builder
+# -----------------------------
+SQL_NEW_REVIEWS_FOR_FILE = f"""
+WITH file_rows AS (
+  SELECT DISTINCT
+    review_no,
+    SAFE_CAST(review_seq AS INT64) AS review_seq
+  FROM `{PROJECT_ID}.{DATASET}.reviews_raw`
+  WHERE source_bucket = @bucket
+    AND source_object = @object_name
+    AND source_generation = @generation
+),
+targets AS (
+  SELECT
+    c.review_key,
+    c.brand_no,
+    c.product_no,
+    c.channel,
+    c.review_text_masked,
+    c.write_date,
+    c.review_score
+  FROM `{PROJECT_ID}.{DATASET}.reviews_clean` c
+  JOIN file_rows r
+    ON c.review_no = r.review_no
+   AND c.review_seq = r.review_seq
+)
+SELECT t.*
+FROM targets t
+LEFT JOIN `{PROJECT_ID}.{DATASET}.review_llm_extract` e
+  ON e.review_key = t.review_key
+WHERE e.review_key IS NULL
+"""
+
+def _build_prompt(row: dict) -> str:
+    review_text = (row.get("review_text_masked") or "").strip()
+    if len(review_text) > 1200:
+        review_text = review_text[:1200] + "…"
+
+    return f"""
+너는 패션/의류 상품평을 생산/디자인/QC 관점에서 구조화하는 분석기다.
+반드시 JSON 한 개만 출력한다. (설명/문장/코드블록 금지)
+
+허용값:
+- issue_category: ["봉제","원단","색상","사이즈핏","내구성","냄새","배송포장","기타"]
+- severity: ["경미","보통","중대"]
+- sentiment: ["불만","중립","칭찬"]
+- size_feedback: ["작다","크다","정사이즈","불명"]
+- repurchase_intent: ["있음","없음","불명"]
+
+출력 스키마(키 이름 고정):
+{{
+  "review_key": "{row["review_key"]}",
+  "brand_no": "{row.get("brand_no","")}",
+  "product_no": "{row.get("product_no","")}",
+  "channel": "{row.get("channel","")}",
+  "issue_category": "",
+  "severity": "",
+  "sentiment": "",
+  "signals": {{
+    "size_feedback": "",
+    "defect_part": "",
+    "color_mentioned": "",
+    "repurchase_intent": ""
+  }},
+  "evidence": "",
+  "action_suggestion": ""
+}}
+
+리뷰 텍스트:
+{review_text}
+""".strip()
+
+def make_batch_input_jsonl_and_upload(bucket: str, object_name: str, generation: str) -> str:
+    bq = _bq()
+    gcs = _gcs()
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("bucket", "STRING", bucket),
+            bigquery.ScalarQueryParameter("object_name", "STRING", object_name),
+            bigquery.ScalarQueryParameter("generation", "STRING", generation),
+        ]
+    )
+
+    tmp_path = f"/tmp/batch_input_{uuid.uuid4().hex}.jsonl"
+    rows_written = 0
+
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        for r in bq.query(SQL_NEW_REVIEWS_FOR_FILE, job_config=job_config).result(page_size=1000):
+            row = dict(r)
+            prompt = _build_prompt(row)
+
+            line = {
+                "request": {
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "temperature": 0.2,
+                        "maxOutputTokens": 256,
+                        "responseMimeType": "application/json",
+                    },
+                }
+            }
+            f.write(json.dumps(line, ensure_ascii=False) + "\n")
+            rows_written += 1
+
+    if rows_written == 0:
+        logger.info("BATCH INPUT: no targets (already analyzed or empty)")
+        return ""
+
+    dest_blob = f"{BATCH_INPUT_PREFIX}/{object_name}/{generation}/batch_input.jsonl"
+    gcs.bucket(BATCH_BUCKET).blob(dest_blob).upload_from_filename(
+        tmp_path, content_type="application/jsonl"
+    )
+
+    input_uri = f"gs://{BATCH_BUCKET}/{dest_blob}"
+    logger.info("BATCH INPUT uploaded: %s (rows=%d)", input_uri, rows_written)
+    return input_uri
+
+
+# -----------------------------
+# Vertex AI Gemini Batch submit
+# -----------------------------
+def submit_vertex_batch_job(input_jsonl_gcs_uri: str, object_name: str, generation: str) -> str:
+    """
+    input_jsonl_gcs_uri: gs://.../batch_input.jsonl
+    return: job.name (string)
+    """
+    if not input_jsonl_gcs_uri:
+        return ""
+
+    # output prefix를 파일별로 분리(결과 혼합 방지)
+    # 예: gs://.../batch_outputs/review_test.xlsx/<gen>/
+    output_prefix = BATCH_OUTPUT_PREFIX.rstrip("/") + f"/{object_name}/{generation}/"
+
+    # Vertex AI 사용 설정 (SDK가 env를 참조)
+    os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "True"
+    os.environ["GOOGLE_CLOUD_PROJECT"] = PROJECT_ID
+    os.environ["GOOGLE_CLOUD_LOCATION"] = VERTEX_LOCATION
+
+    client = genai.Client(http_options=HttpOptions(api_version="v1"))
+    job = client.batches.create(
+        model=VERTEX_GEMINI_MODEL,
+        src=input_jsonl_gcs_uri,
+        config=CreateBatchJobConfig(dest=output_prefix),
+    )
+
+    job_name = getattr(job, "name", "") or str(job)
+    logger.info("BATCH SUBMITTED model=%s location=%s input=%s output=%s job=%s",
+                VERTEX_GEMINI_MODEL, VERTEX_LOCATION, input_jsonl_gcs_uri, output_prefix, job_name)
+    return job_name
+
+
+# -----------------------------
 # CloudEvent handler
 # -----------------------------
 @functions_framework.cloud_event
@@ -300,13 +474,12 @@ def ingest_from_gcs(cloud_event: CloudEvent):
     logger.info("EVENT bucket=%s name=%s generation=%s", bucket, name, generation)
     logger.info("EVENT type=%s source=%s id=%s",
                 cloud_event.get("type"), cloud_event.get("source"), cloud_event.get("id"))
-    logger.info("EVENT data=%s", json.dumps(data, ensure_ascii=False))
 
     if not bucket or not name:
         logger.warning("Missing bucket/name in event payload. data=%s", data)
         return ("OK", 200)
 
-    # 중복 처리 방지
+    # 중복 처리 방지(완료된 파일/세대면 바로 종료)
     if _already_done(bucket, name, generation):
         logger.info("SKIP already DONE: %s/%s gen=%s", bucket, name, generation)
         return ("OK", 200)
@@ -314,13 +487,29 @@ def ingest_from_gcs(cloud_event: CloudEvent):
     _mark_ingestion("STARTED", bucket, name, generation)
 
     try:
+        # 1) 다운로드 & 로드
         local_path = _download_xlsx(bucket, name)
         df_std = _load_excel_mapped(local_path)
 
-        _append_reviews_raw(df_std, bucket, name, generation)
+        # 2) raw 적재(재시도 시 중복 append 방지)
+        if not _raw_already_loaded(bucket, name, generation):
+            _append_reviews_raw(df_std, bucket, name, generation)
+        else:
+            logger.info("SKIP reviews_raw already loaded for %s/%s gen=%s", bucket, name, generation)
+
+        # 3) clean merge (idempotent)
         _merge_reviews_clean(df_std)
 
-        _mark_ingestion("DONE", bucket, name, generation)
+        # 4) batch input 생성 + 업로드
+        input_uri = make_batch_input_jsonl_and_upload(bucket, name, generation)
+
+        # 5) batch job 제출 + job_name 로그
+        job_name = submit_vertex_batch_job(input_uri, name, generation)
+        if input_uri and not job_name:
+            raise RuntimeError("Batch job submission failed (job_name empty)")
+
+        # 6) 완료 마킹 (job_name은 로그로 남김)
+        _mark_ingestion("DONE", bucket, name, generation, error_message=(f"BATCH_JOB={job_name}" if job_name else "NO_TARGETS"))
         return ("OK", 200)
 
     except Exception as e:
