@@ -15,3 +15,4 @@ google-cloud-dlp>=3.18.0
 
 # (옵션) Vertex AI / Gemini (추후 LLM 호출/배치 제출용)
 google-genai>=1.0.0
+google-auth>=2.0.0

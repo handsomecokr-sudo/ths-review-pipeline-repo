@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 import functions_framework
 import pandas as pd
 from cloudevents.http import CloudEvent
+import google.auth  # ✅ 추가
+
 from google.cloud import bigquery
 from google.cloud import storage
 
@@ -17,9 +19,28 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("review-pipeline")
 
 # -----------------------------
-# Config
+# Config (Project ID 안전하게 가져오기)
 # -----------------------------
-PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")  # Cloud Run 기본 제공
+def _get_project_id() -> str:
+    # 1) 환경변수 우선 (어떤 환경에서든 유연하게)
+    env_pid = (
+        os.getenv("GOOGLE_CLOUD_PROJECT")
+        or os.getenv("GCP_PROJECT")
+        or os.getenv("PROJECT_ID")
+        or os.getenv("BQ_PROJECT_ID")
+    )
+    if env_pid:
+        return env_pid
+
+    # 2) Cloud Run/ADC(Application Default Credentials)에서 project id 얻기
+    _, pid = google.auth.default()
+    if not pid:
+        raise RuntimeError(
+            "Project ID를 찾지 못했습니다. Cloud Run에 PROJECT_ID(또는 GOOGLE_CLOUD_PROJECT) env를 설정하세요."
+        )
+    return pid
+
+PROJECT_ID = _get_project_id()  # ✅ 교체
 DATASET = os.getenv("BQ_DATASET", "ths_review_analytics")
 
 TABLE_INGEST = f"{PROJECT_ID}.{DATASET}.ingestion_files"
