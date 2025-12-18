@@ -598,13 +598,24 @@ def make_batch_input_jsonl_and_upload(bucket: str, object_name: str, generation:
 
 def _normalize_model_name(model: str) -> str:
     """
-    google-genai batches.create에서 모델명을 publisher 경로로 요구하는 경우가 있어 안전하게 보정
+    Batch(batches.create)에서는 alias(gemini-2.0-flash-lite 등)가 거부되는 케이스가 있어
+    문서의 stable version ID(-001)로 보정 후 publisher 경로로 반환.
     """
     m = (model or "").strip()
     if not m:
-        return "publishers/google/models/gemini-2.0-flash"
+        m = "gemini-2.0-flash-lite-001"
+
+    alias_to_version = {
+        # 문서의 auto-updated alias -> stable version 
+        "gemini-2.0-flash-lite": "gemini-2.0-flash-lite-001",
+        "gemini-2.0-flash": "gemini-2.0-flash-001",
+    }
+    m = alias_to_version.get(m, m)
+
+    # 이미 전체 경로면 그대로
     if "/" in m:
         return m
+
     return f"publishers/google/models/{m}"
 
 
@@ -627,6 +638,7 @@ def submit_vertex_batch_job_global(input_jsonl_gcs_uri: str, object_name: str, g
         src=input_jsonl_gcs_uri,
         config=CreateBatchJobConfig(dest=output_prefix),
     )
+
 
     job_name = getattr(job, "name", "") or str(job)
     logger.info(
