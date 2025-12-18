@@ -1,10 +1,11 @@
 import json
 import logging
 import os
+import re
 import uuid
 import zipfile
 from datetime import datetime, date, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Iterable, Tuple
 
 import functions_framework
 import google.auth
@@ -18,11 +19,13 @@ from google.cloud import storage
 from google import genai
 from google.genai.types import CreateBatchJobConfig, HttpOptions
 
+
 # -----------------------------
 # Logging
 # -----------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("review-pipeline")
+
 
 # -----------------------------
 # Project / Config
@@ -51,7 +54,8 @@ UPLOAD_BUCKET = (os.getenv("UPLOAD_BUCKET") or "ths-review-upload-bkt").strip()
 ARCHIVE_BUCKET = (os.getenv("ARCHIVE_BUCKET") or "ths-review-archive-bkt").strip()
 
 # Batch
-VERTEX_GEMINI_MODEL = os.getenv("VERTEX_GEMINI_MODEL", "gemini-2.0-flash").strip()
+# (Batch에서 alias가 거부되는 경우가 있어 stable version(-001) 기본 추천)
+VERTEX_GEMINI_MODEL = (os.getenv("VERTEX_GEMINI_MODEL") or "gemini-2.0-flash-lite-001").strip()
 BATCH_INPUT_PREFIX = (os.getenv("BATCH_INPUT_PREFIX") or "batch_inputs").strip().strip("/")
 BATCH_OUTPUT_PREFIX = (os.getenv("BATCH_OUTPUT_PREFIX") or "batch_outputs").strip().strip("/")
 
@@ -61,8 +65,9 @@ TABLE_RAW = f"{PROJECT_ID}.{DATASET}.reviews_raw"
 TABLE_CLEAN = f"{PROJECT_ID}.{DATASET}.reviews_clean"
 TABLE_LLM = f"{PROJECT_ID}.{DATASET}.review_llm_extract"
 
-# Fixed staging table (do not create tons of tables)
+# Fixed staging tables (do not create tons of tables)
 STG_CLEAN = f"{PROJECT_ID}.{DATASET}.staging_reviews_clean"
+STG_LLM = f"{PROJECT_ID}.{DATASET}.staging_review_llm_extract"
 
 # Excel header mapping (Korean -> Std)
 EXCEL_TO_STD = {
@@ -94,6 +99,7 @@ EXPECTED_STD_COLS = [
     "review_ai_score",
     "review_ai_contents",
 ]
+
 
 # -----------------------------
 # Clients
@@ -152,6 +158,9 @@ def _normalize_write_date_to_ymd(v: Any) -> str:
 
 
 def _is_internal_object(name: str) -> bool:
+    """
+    업로드 버킷에서 내부 생성물(재트리거 유발) 방지용.
+    """
     n = (name or "").lstrip("/")
     return (
         n.startswith(BATCH_INPUT_PREFIX + "/")
@@ -159,6 +168,81 @@ def _is_internal_object(name: str) -> bool:
         or n.lower().endswith(".jsonl")
         or n.lower().endswith(".ndjson")
     )
+
+
+def _strip_code_fences(s: str) -> str:
+    """
+    ```json ... ``` 혹은 ``` ... ``` 제거
+    """
+    if not s:
+        return s
+    t = s.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", t)
+        t = re.sub(r"\s*```$", "", t)
+    return t.strip()
+
+
+def _safe_json_loads(s: str) -> Optional[Any]:
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+
+def _extract_first_json_blob(text: str) -> Optional[Any]:
+    """
+    모델 출력이 순수 JSON이 아닐 때(앞뒤 잡문) 최소한으로 복구:
+    - 가장 바깥 {} 또는 [] 덩어리를 잘라 json.loads 시도
+    """
+    if not text:
+        return None
+    t = text.strip()
+
+    # 우선 전체 시도
+    j = _safe_json_loads(t)
+    if j is not None:
+        return j
+
+    # {} 후보
+    i1 = t.find("{")
+    i2 = t.rfind("}")
+    if i1 != -1 and i2 != -1 and i2 > i1:
+        cand = t[i1 : i2 + 1].strip()
+        j = _safe_json_loads(cand)
+        if j is not None:
+            return j
+
+    # [] 후보
+    a1 = t.find("[")
+    a2 = t.rfind("]")
+    if a1 != -1 and a2 != -1 and a2 > a1:
+        cand = t[a1 : a2 + 1].strip()
+        j = _safe_json_loads(cand)
+        if j is not None:
+            return j
+
+    return None
+
+
+def _normalize_model_name(model: str) -> str:
+    """
+    Batch(batches.create)에서는 alias(gemini-2.0-flash 등)가 거부되는 케이스가 있어
+    stable version(-001)로 보정 후 publisher 경로로 반환.
+    """
+    m = (model or "").strip()
+    if not m:
+        m = "gemini-2.0-flash-lite-001"
+
+    alias_to_version = {
+        "gemini-2.0-flash-lite": "gemini-2.0-flash-lite-001",
+        "gemini-2.0-flash": "gemini-2.0-flash-001",
+    }
+    m = alias_to_version.get(m, m)
+
+    if "/" in m:
+        return m
+    return f"publishers/google/models/{m}"
 
 
 # -----------------------------
@@ -235,7 +319,13 @@ def _already_done(bucket: str, object_name: str, generation: str) -> bool:
     return bool(rows) and rows[0]["status"] == "DONE"
 
 
-def _mark_ingestion(status: str, bucket: str, object_name: str, generation: str, error_message: Optional[str] = None):
+def _mark_ingestion(
+    status: str,
+    bucket: str,
+    object_name: str,
+    generation: str,
+    error_message: Optional[str] = None,
+):
     client = _bq()
     sql = f"""
     INSERT INTO `{TABLE_INGEST}` (bucket, object_name, generation, received_at, status, error_message)
@@ -312,7 +402,7 @@ def _append_reviews_raw_ndjson(df_std: pd.DataFrame, bucket: str, name: str, gen
 
 
 # -----------------------------
-# (1) reviews_clean MERGE (review_seq STRING 버전) - 통째 교체
+# reviews_clean MERGE (review_seq STRING 버전)
 # -----------------------------
 def _merge_reviews_clean_fixed_staging(df_std: pd.DataFrame):
     """
@@ -324,7 +414,7 @@ def _merge_reviews_clean_fixed_staging(df_std: pd.DataFrame):
     client = _bq()
     loaded_at = _now_utc().isoformat()
 
-    # staging 고정 테이블 (전부 STRING + loaded_at STRING)  ← 파싱 오류 방지
+    # staging 고정 테이블 (전부 STRING)
     create_sql = f"""
     CREATE TABLE IF NOT EXISTS `{STG_CLEAN}` (
       review_key STRING,
@@ -348,10 +438,8 @@ def _merge_reviews_clean_fixed_staging(df_std: pd.DataFrame):
     client.query(create_sql).result()
 
     df = df_std.copy()
-
     df["review_no"] = df["review_no"].astype(str).str.strip()
     df["review_seq"] = df["review_seq"].astype(str).str.strip()
-
     df["write_date_str"] = df["write_date"].apply(_normalize_write_date_to_ymd)
 
     # 필수키 검증
@@ -367,14 +455,10 @@ def _merge_reviews_clean_fixed_staging(df_std: pd.DataFrame):
         logger.info("No valid rows to merge into reviews_clean")
         return
 
-    # review_key = review_no-review_seq (STRING)
     df["review_key"] = df["review_no"] + "-" + df["review_seq"]
-
-    # MVP: DLP 전이면 원문 그대로
     df["review_text_masked"] = df["review_contents"].astype(str)
     df["normalized_text"] = df["review_contents"].astype(str)
 
-    # staging rows(전부 STRING)
     rows: List[Dict[str, Any]] = []
     for _, r in df.iterrows():
         rows.append({
@@ -384,7 +468,7 @@ def _merge_reviews_clean_fixed_staging(df_std: pd.DataFrame):
             "channel": str(r.get("channel", "")),
             "brand_no": str(r.get("brand_no", "")),
             "product_no": str(r.get("product_no", "")),
-            "write_date": str(r.get("write_date_str", "")),  # YYYY-MM-DD
+            "write_date": str(r.get("write_date_str", "")),
             "review_score": str(r.get("review_score", "")),
             "review_1depth": str(r.get("review_1depth", "")),
             "review_2depth": str(r.get("review_2depth", "")),
@@ -403,79 +487,77 @@ def _merge_reviews_clean_fixed_staging(df_std: pd.DataFrame):
 
     _load_ndjson_to_table(STG_CLEAN, tmp, write_disposition="WRITE_TRUNCATE")
 
-    # ✅ MERGE: review_seq는 STRING 그대로
     merge_sql = f"""
-        MERGE `{TABLE_CLEAN}` T
-        USING (
-        SELECT * EXCEPT(rn)
-        FROM (
-            SELECT
-            S.*,
-            ROW_NUMBER() OVER (PARTITION BY review_key ORDER BY CAST(loaded_at AS STRING) DESC) AS rn
-            FROM `{STG_CLEAN}` S
-        )
-        WHERE rn = 1
-        ) S
-        ON T.review_key = S.review_key
-        WHEN MATCHED THEN UPDATE SET
-        review_no = CAST(S.review_no AS STRING),
-        review_seq = CAST(S.review_seq AS STRING),
-        channel = CAST(S.channel AS STRING),
-        brand_no = CAST(S.brand_no AS STRING),
-        product_no = CAST(S.product_no AS STRING),
+    MERGE `{TABLE_CLEAN}` T
+    USING (
+      SELECT * EXCEPT(rn)
+      FROM (
+        SELECT
+          S.*,
+          ROW_NUMBER() OVER (PARTITION BY review_key ORDER BY CAST(loaded_at AS STRING) DESC) AS rn
+        FROM `{STG_CLEAN}` S
+      )
+      WHERE rn = 1
+    ) S
+    ON T.review_key = S.review_key
+    WHEN MATCHED THEN UPDATE SET
+      review_no = CAST(S.review_no AS STRING),
+      review_seq = CAST(S.review_seq AS STRING),
+      channel = CAST(S.channel AS STRING),
+      brand_no = CAST(S.brand_no AS STRING),
+      product_no = CAST(S.product_no AS STRING),
 
-        write_date = SAFE_CAST(NULLIF(CAST(S.write_date AS STRING), '') AS DATE),
-        review_score = SAFE_CAST(NULLIF(CAST(S.review_score AS STRING), '') AS INT64),
+      write_date = SAFE_CAST(NULLIF(CAST(S.write_date AS STRING), '') AS DATE),
+      review_score = SAFE_CAST(NULLIF(CAST(S.review_score AS STRING), '') AS INT64),
 
-        review_1depth = CAST(S.review_1depth AS STRING),
-        review_2depth = CAST(S.review_2depth AS STRING),
+      review_1depth = CAST(S.review_1depth AS STRING),
+      review_2depth = CAST(S.review_2depth AS STRING),
 
-        review_contents = CAST(S.review_contents AS STRING),
-        review_text_masked = CAST(S.review_text_masked AS STRING),
-        normalized_text = CAST(S.normalized_text AS STRING),
+      review_contents = CAST(S.review_contents AS STRING),
+      review_text_masked = CAST(S.review_text_masked AS STRING),
+      normalized_text = CAST(S.normalized_text AS STRING),
 
-        legacy_review_ai_score = SAFE_CAST(NULLIF(CAST(S.legacy_review_ai_score AS STRING), '') AS FLOAT64),
-        legacy_review_ai_contents = CAST(S.legacy_review_ai_contents AS STRING),
+      legacy_review_ai_score = SAFE_CAST(NULLIF(CAST(S.legacy_review_ai_score AS STRING), '') AS FLOAT64),
+      legacy_review_ai_contents = CAST(S.legacy_review_ai_contents AS STRING),
 
-        loaded_at = SAFE_CAST(NULLIF(CAST(S.loaded_at AS STRING), '') AS TIMESTAMP)
+      loaded_at = SAFE_CAST(NULLIF(CAST(S.loaded_at AS STRING), '') AS TIMESTAMP)
+    WHEN NOT MATCHED THEN
+      INSERT (
+        review_key, review_no, review_seq, channel, brand_no, product_no,
+        write_date, review_score, review_1depth, review_2depth,
+        review_contents, review_text_masked, normalized_text,
+        legacy_review_ai_score, legacy_review_ai_contents, loaded_at
+      )
+      VALUES (
+        CAST(S.review_key AS STRING),
+        CAST(S.review_no AS STRING),
+        CAST(S.review_seq AS STRING),
+        CAST(S.channel AS STRING),
+        CAST(S.brand_no AS STRING),
+        CAST(S.product_no AS STRING),
 
-        WHEN NOT MATCHED THEN
-        INSERT (
-            review_key, review_no, review_seq, channel, brand_no, product_no,
-            write_date, review_score, review_1depth, review_2depth,
-            review_contents, review_text_masked, normalized_text,
-            legacy_review_ai_score, legacy_review_ai_contents, loaded_at
-        )
-        VALUES (
-            CAST(S.review_key AS STRING),
-            CAST(S.review_no AS STRING),
-            CAST(S.review_seq AS STRING),
-            CAST(S.channel AS STRING),
-            CAST(S.brand_no AS STRING),
-            CAST(S.product_no AS STRING),
+        SAFE_CAST(NULLIF(CAST(S.write_date AS STRING), '') AS DATE),
+        SAFE_CAST(NULLIF(CAST(S.review_score AS STRING), '') AS INT64),
 
-            SAFE_CAST(NULLIF(CAST(S.write_date AS STRING), '') AS DATE),
-            SAFE_CAST(NULLIF(CAST(S.review_score AS STRING), '') AS INT64),
-            CAST(S.review_1depth AS STRING),
-            CAST(S.review_2depth AS STRING),
+        CAST(S.review_1depth AS STRING),
+        CAST(S.review_2depth AS STRING),
 
-            CAST(S.review_contents AS STRING),
-            CAST(S.review_text_masked AS STRING),
-            CAST(S.normalized_text AS STRING),
+        CAST(S.review_contents AS STRING),
+        CAST(S.review_text_masked AS STRING),
+        CAST(S.normalized_text AS STRING),
 
-            SAFE_CAST(NULLIF(CAST(S.legacy_review_ai_score AS STRING), '') AS FLOAT64),
-            CAST(S.legacy_review_ai_contents AS STRING),
+        SAFE_CAST(NULLIF(CAST(S.legacy_review_ai_score AS STRING), '') AS FLOAT64),
+        CAST(S.legacy_review_ai_contents AS STRING),
 
-            SAFE_CAST(NULLIF(CAST(S.loaded_at AS STRING), '') AS TIMESTAMP)
-        )
-        """
-
+        SAFE_CAST(NULLIF(CAST(S.loaded_at AS STRING), '') AS TIMESTAMP)
+      )
+    """
     client.query(merge_sql).result()
     logger.info("BQ MERGE reviews_clean done rows=%d (seq=STRING)", len(rows))
 
 
 # -----------------------------
-# (2) “이번 파일 신규 대상” SQL (STRING 조인 버전) - 통째 교체
+# “이번 파일 신규 대상” SQL (STRING 조인 버전)
 # -----------------------------
 SQL_NEW_REVIEWS_FOR_FILE = f"""
 WITH file_rows AS (
@@ -596,29 +678,6 @@ def make_batch_input_jsonl_and_upload(bucket: str, object_name: str, generation:
     return input_uri
 
 
-def _normalize_model_name(model: str) -> str:
-    """
-    Batch(batches.create)에서는 alias(gemini-2.0-flash-lite 등)가 거부되는 케이스가 있어
-    문서의 stable version ID(-001)로 보정 후 publisher 경로로 반환.
-    """
-    m = (model or "").strip()
-    if not m:
-        m = "gemini-2.0-flash-lite-001"
-
-    alias_to_version = {
-        # 문서의 auto-updated alias -> stable version 
-        "gemini-2.0-flash-lite": "gemini-2.0-flash-lite-001",
-        "gemini-2.0-flash": "gemini-2.0-flash-001",
-    }
-    m = alias_to_version.get(m, m)
-
-    # 이미 전체 경로면 그대로
-    if "/" in m:
-        return m
-
-    return f"publishers/google/models/{m}"
-
-
 def submit_vertex_batch_job_global(input_jsonl_gcs_uri: str, object_name: str, generation: str) -> str:
     if not input_jsonl_gcs_uri:
         return ""
@@ -639,7 +698,6 @@ def submit_vertex_batch_job_global(input_jsonl_gcs_uri: str, object_name: str, g
         config=CreateBatchJobConfig(dest=output_prefix),
     )
 
-
     job_name = getattr(job, "name", "") or str(job)
     logger.info(
         "BATCH SUBMITTED location=global model=%s input=%s output=%s job=%s",
@@ -652,22 +710,423 @@ def submit_vertex_batch_job_global(input_jsonl_gcs_uri: str, object_name: str, g
 
 
 # -----------------------------
-# Main handler
+# review_llm_extract: DDL + MERGE
+# -----------------------------
+def _ensure_review_llm_extract_table():
+    """
+    (a) review_llm_extract 테이블 DDL 가정
+    - 없으면 생성
+    - 있으면 그대로 사용
+    """
+    client = _bq()
+    ddl = f"""
+    CREATE TABLE IF NOT EXISTS `{TABLE_LLM}` (
+      review_key STRING,
+      brand_no STRING,
+      product_no STRING,
+      channel STRING,
+
+      issue_category STRING,
+      severity STRING,
+      sentiment STRING,
+
+      size_feedback STRING,
+      defect_part STRING,
+      color_mentioned STRING,
+      repurchase_intent STRING,
+
+      evidence STRING,
+      action_suggestion STRING,
+
+      model_version STRING,
+      response_id STRING,
+      processed_time TIMESTAMP,
+
+      source_object STRING,
+      source_generation STRING,
+      output_object STRING,
+      output_generation STRING,
+
+      ingested_at TIMESTAMP,
+
+      raw_output_text STRING,
+      parse_error STRING
+    )
+    PARTITION BY DATE(ingested_at)
+    CLUSTER BY brand_no, product_no, channel
+    """
+    client.query(ddl).result()
+
+    # staging도 고정 테이블로 확보 (전부 STRING)
+    stg = f"""
+    CREATE TABLE IF NOT EXISTS `{STG_LLM}` (
+      review_key STRING,
+      brand_no STRING,
+      product_no STRING,
+      channel STRING,
+
+      issue_category STRING,
+      severity STRING,
+      sentiment STRING,
+
+      size_feedback STRING,
+      defect_part STRING,
+      color_mentioned STRING,
+      repurchase_intent STRING,
+
+      evidence STRING,
+      action_suggestion STRING,
+
+      model_version STRING,
+      response_id STRING,
+      processed_time STRING,
+
+      source_object STRING,
+      source_generation STRING,
+      output_object STRING,
+      output_generation STRING,
+
+      ingested_at STRING,
+
+      raw_output_text STRING,
+      parse_error STRING
+    )
+    """
+    client.query(stg).result()
+
+
+def _iter_gcs_lines(bucket: str, name: str) -> Iterable[str]:
+    """
+    predictions.jsonl 같은 큰 파일도 메모리 폭발 없이 라인 스트리밍
+    """
+    client = _gcs()
+    blob = client.bucket(bucket).blob(name)
+    with blob.open("r", encoding="utf-8") as f:
+        for line in f:
+            yield line.rstrip("\n")
+
+
+def _extract_model_output_text(pred_line_json: dict) -> Tuple[str, str, str, str]:
+    """
+    prediction 한 줄(JSON)에서:
+    - model_output_text
+    - model_version
+    - response_id
+    - processed_time(문자열)
+    """
+    model_version = ""
+    response_id = ""
+    processed_time = ""
+
+    resp = pred_line_json.get("response") or {}
+    response_id = str(resp.get("responseId") or "")
+    model_version = str(resp.get("modelVersion") or "")
+    processed_time = str(resp.get("processed_time") or "")
+
+    out_text = ""
+    try:
+        out_text = (
+            resp.get("candidates", [])[0]
+                .get("content", {})
+                .get("parts", [])[0]
+                .get("text", "")
+        )
+    except Exception:
+        out_text = ""
+
+    return str(out_text or ""), model_version, response_id, processed_time
+
+
+def _normalize_llm_items_from_output_text(output_text: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """
+    (b) 단일 JSON / 배열 JSON 모두 지원
+    - output_text 자체가 JSON이 아니면 최대한 복구
+    - 결과: items(list[dict]), parse_error(str|None)
+    """
+    t = _strip_code_fences(output_text)
+
+    parsed = _safe_json_loads(t)
+    if parsed is None:
+        parsed = _extract_first_json_blob(t)
+
+    if parsed is None:
+        return [], "MODEL_OUTPUT_NOT_JSON"
+
+    if isinstance(parsed, dict):
+        return [parsed], None
+
+    if isinstance(parsed, list):
+        items = [x for x in parsed if isinstance(x, dict)]
+        if not items:
+            return [], "MODEL_OUTPUT_JSON_ARRAY_EMPTY_OR_NOT_OBJECTS"
+        return items, None
+
+    return [], "MODEL_OUTPUT_JSON_NOT_OBJECT_OR_ARRAY"
+
+
+def _coerce_str(x: Any) -> str:
+    if x is None:
+        return ""
+    return str(x)
+
+
+def _build_llm_row(
+    item: Dict[str, Any],
+    *,
+    model_version: str,
+    response_id: str,
+    processed_time: str,
+    source_object: str,
+    source_generation: str,
+    output_object: str,
+    output_generation: str,
+    ingested_at_iso: str,
+    raw_output_text: str,
+    parse_error: str,
+) -> Optional[Dict[str, Any]]:
+    review_key = _coerce_str(item.get("review_key")).strip()
+    if not review_key:
+        return None
+
+    signals = item.get("signals") if isinstance(item.get("signals"), dict) else {}
+
+    return {
+        "review_key": review_key,
+        "brand_no": _coerce_str(item.get("brand_no")),
+        "product_no": _coerce_str(item.get("product_no")),
+        "channel": _coerce_str(item.get("channel")),
+
+        "issue_category": _coerce_str(item.get("issue_category")),
+        "severity": _coerce_str(item.get("severity")),
+        "sentiment": _coerce_str(item.get("sentiment")),
+
+        "size_feedback": _coerce_str(signals.get("size_feedback")),
+        "defect_part": _coerce_str(signals.get("defect_part")),
+        "color_mentioned": _coerce_str(signals.get("color_mentioned")),
+        "repurchase_intent": _coerce_str(signals.get("repurchase_intent")),
+
+        "evidence": _coerce_str(item.get("evidence")),
+        "action_suggestion": _coerce_str(item.get("action_suggestion")),
+
+        "model_version": _coerce_str(model_version),
+        "response_id": _coerce_str(response_id),
+        "processed_time": _coerce_str(processed_time),
+
+        "source_object": _coerce_str(source_object),
+        "source_generation": _coerce_str(source_generation),
+        "output_object": _coerce_str(output_object),
+        "output_generation": _coerce_str(output_generation),
+
+        "ingested_at": _coerce_str(ingested_at_iso),
+
+        "raw_output_text": _coerce_str(raw_output_text),
+        "parse_error": _coerce_str(parse_error),
+    }
+
+
+def _merge_review_llm_extract_from_predictions(
+    *,
+    archive_bucket: str,
+    predictions_object: str,
+    output_generation: str,
+):
+    """
+    (c) predictions.jsonl -> staging load -> MERGE into review_llm_extract
+    """
+    _ensure_review_llm_extract_table()
+    client = _bq()
+
+    # batch_outputs/<object_name>/<source_generation>/.../predictions.jsonl
+    # source_object, source_generation 추출
+    n = (predictions_object or "").lstrip("/")
+    parts = n.split("/")
+    source_object = ""
+    source_generation = ""
+    if len(parts) >= 3 and parts[0] == BATCH_OUTPUT_PREFIX:
+        source_object = parts[1]
+        source_generation = parts[2]
+
+    ingested_at_iso = _now_utc().isoformat()
+
+    tmp = f"/tmp/llm_{uuid.uuid4().hex}.ndjson"
+    total_lines = 0
+    extracted_rows = 0
+    bad_lines = 0
+
+    with open(tmp, "w", encoding="utf-8") as out:
+        for line in _iter_gcs_lines(archive_bucket, predictions_object):
+            if not line.strip():
+                continue
+            total_lines += 1
+
+            j = _safe_json_loads(line)
+            if not isinstance(j, dict):
+                bad_lines += 1
+                continue
+
+            output_text, model_version, response_id, processed_time = _extract_model_output_text(j)
+
+            items, per_line_err = _normalize_llm_items_from_output_text(output_text)
+            if per_line_err:
+                # parse 실패해도 review_key가 있으면 저장하고 싶다면: request에서 review_key 추출이 필요함.
+                # 지금은 "정상 파싱된 것만 적재"로 단순화.
+                bad_lines += 1
+                continue
+
+            for item in items:
+                row = _build_llm_row(
+                    item,
+                    model_version=model_version,
+                    response_id=response_id,
+                    processed_time=processed_time,
+                    source_object=source_object,
+                    source_generation=source_generation,
+                    output_object=predictions_object,
+                    output_generation=output_generation,
+                    ingested_at_iso=ingested_at_iso,
+                    raw_output_text=output_text,
+                    parse_error="",
+                )
+                if not row:
+                    bad_lines += 1
+                    continue
+
+                out.write(json.dumps(row, ensure_ascii=False) + "\n")
+                extracted_rows += 1
+
+    if extracted_rows == 0:
+        logger.info(
+            "LLM MERGE SKIP: no extracted rows. total_lines=%d bad_lines=%d object=%s",
+            total_lines, bad_lines, predictions_object
+        )
+        return
+
+    _load_ndjson_to_table(STG_LLM, tmp, write_disposition="WRITE_TRUNCATE")
+
+    merge_sql = f"""
+    MERGE `{TABLE_LLM}` T
+    USING (
+      SELECT * EXCEPT(rn)
+      FROM (
+        SELECT
+          S.*,
+          ROW_NUMBER() OVER (PARTITION BY review_key ORDER BY CAST(ingested_at AS STRING) DESC) AS rn
+        FROM `{STG_LLM}` S
+      )
+      WHERE rn = 1
+    ) S
+    ON T.review_key = S.review_key
+    WHEN MATCHED THEN UPDATE SET
+      brand_no = CAST(S.brand_no AS STRING),
+      product_no = CAST(S.product_no AS STRING),
+      channel = CAST(S.channel AS STRING),
+
+      issue_category = CAST(S.issue_category AS STRING),
+      severity = CAST(S.severity AS STRING),
+      sentiment = CAST(S.sentiment AS STRING),
+
+      size_feedback = CAST(S.size_feedback AS STRING),
+      defect_part = CAST(S.defect_part AS STRING),
+      color_mentioned = CAST(S.color_mentioned AS STRING),
+      repurchase_intent = CAST(S.repurchase_intent AS STRING),
+
+      evidence = CAST(S.evidence AS STRING),
+      action_suggestion = CAST(S.action_suggestion AS STRING),
+
+      model_version = CAST(S.model_version AS STRING),
+      response_id = CAST(S.response_id AS STRING),
+      processed_time = SAFE_CAST(NULLIF(CAST(S.processed_time AS STRING), '') AS TIMESTAMP),
+
+      source_object = CAST(S.source_object AS STRING),
+      source_generation = CAST(S.source_generation AS STRING),
+      output_object = CAST(S.output_object AS STRING),
+      output_generation = CAST(S.output_generation AS STRING),
+
+      ingested_at = SAFE_CAST(NULLIF(CAST(S.ingested_at AS STRING), '') AS TIMESTAMP),
+
+      raw_output_text = CAST(S.raw_output_text AS STRING),
+      parse_error = CAST(S.parse_error AS STRING)
+
+    WHEN NOT MATCHED THEN
+      INSERT (
+        review_key, brand_no, product_no, channel,
+        issue_category, severity, sentiment,
+        size_feedback, defect_part, color_mentioned, repurchase_intent,
+        evidence, action_suggestion,
+        model_version, response_id, processed_time,
+        source_object, source_generation, output_object, output_generation,
+        ingested_at,
+        raw_output_text, parse_error
+      )
+      VALUES (
+        CAST(S.review_key AS STRING),
+        CAST(S.brand_no AS STRING),
+        CAST(S.product_no AS STRING),
+        CAST(S.channel AS STRING),
+
+        CAST(S.issue_category AS STRING),
+        CAST(S.severity AS STRING),
+        CAST(S.sentiment AS STRING),
+
+        CAST(S.size_feedback AS STRING),
+        CAST(S.defect_part AS STRING),
+        CAST(S.color_mentioned AS STRING),
+        CAST(S.repurchase_intent AS STRING),
+
+        CAST(S.evidence AS STRING),
+        CAST(S.action_suggestion AS STRING),
+
+        CAST(S.model_version AS STRING),
+        CAST(S.response_id AS STRING),
+        SAFE_CAST(NULLIF(CAST(S.processed_time AS STRING), '') AS TIMESTAMP),
+
+        CAST(S.source_object AS STRING),
+        CAST(S.source_generation AS STRING),
+        CAST(S.output_object AS STRING),
+        CAST(S.output_generation AS STRING),
+
+        SAFE_CAST(NULLIF(CAST(S.ingested_at AS STRING), '') AS TIMESTAMP),
+
+        CAST(S.raw_output_text AS STRING),
+        CAST(S.parse_error AS STRING)
+      )
+    """
+    client.query(merge_sql).result()
+
+    logger.info(
+        "LLM MERGE DONE: extracted_rows=%d total_lines=%d bad_lines=%d output=%s",
+        extracted_rows, total_lines, bad_lines, predictions_object
+    )
+
+
+# -----------------------------
+# Batch output routing helpers
+# -----------------------------
+def _is_batch_output_prediction(name: str) -> bool:
+    """
+    batch_outputs/.../predictions.jsonl 만 처리
+    """
+    n = (name or "").lstrip("/")
+    return n.startswith(BATCH_OUTPUT_PREFIX + "/") and n.endswith("/predictions.jsonl")
+
+
+# -----------------------------
+# Main handler: XLSX upload route
 # -----------------------------
 def handle_xlsx_upload_event(bucket: str, name: str, generation: str):
     logger.info("CONFIG UPLOAD_BUCKET=%s ARCHIVE_BUCKET=%s DATASET=%s", UPLOAD_BUCKET, ARCHIVE_BUCKET, DATASET)
 
-    # 0) only target upload bucket + xlsx + not internal objects
+    # only target upload bucket + xlsx + not internal objects
     if bucket != UPLOAD_BUCKET:
-        logger.info("SKIP not a target bucket: bucket=%s name=%s", bucket, name)
+        logger.info("SKIP upload route: not a target bucket bucket=%s name=%s", bucket, name)
         return
 
     if _is_internal_object(name):
-        logger.info("SKIP internal object event: bucket=%s name=%s", bucket, name)
+        logger.info("SKIP upload route: internal object bucket=%s name=%s", bucket, name)
         return
 
     if not name.lower().endswith(".xlsx"):
-        logger.info("SKIP not an xlsx: bucket=%s name=%s", bucket, name)
+        logger.info("SKIP upload route: not an xlsx bucket=%s name=%s", bucket, name)
         return
 
     # 1) download + validate
@@ -702,6 +1161,29 @@ def handle_xlsx_upload_event(bucket: str, name: str, generation: str):
     )
 
 
+# -----------------------------
+# Main handler: Batch output route (ARCHIVE_BUCKET)
+# -----------------------------
+def handle_batch_output_event(bucket: str, name: str, generation: str):
+    if bucket != ARCHIVE_BUCKET:
+        logger.info("SKIP archive route: not archive bucket bucket=%s name=%s", bucket, name)
+        return
+
+    if not _is_batch_output_prediction(name):
+        logger.info("SKIP archive route: not a predictions output name=%s", name)
+        return
+
+    # predictions.jsonl -> review_llm_extract MERGE
+    _merge_review_llm_extract_from_predictions(
+        archive_bucket=bucket,
+        predictions_object=name,
+        output_generation=generation,
+    )
+
+
+# -----------------------------
+# CloudEvent entry (2-way routing)
+# -----------------------------
 @functions_framework.cloud_event
 def ingest_from_gcs(cloud_event: CloudEvent):
     data = cloud_event.data or {}
@@ -711,24 +1193,41 @@ def ingest_from_gcs(cloud_event: CloudEvent):
     generation = str(data.get("generation", "")).strip()
 
     logger.info("EVENT bucket=%s name=%s generation=%s", bucket, name, generation)
-    logger.info("EVENT type=%s source=%s id=%s", cloud_event.get("type"), cloud_event.get("source"), cloud_event.get("id"))
+    logger.info(
+        "EVENT type=%s source=%s id=%s",
+        cloud_event.get("type"),
+        cloud_event.get("source"),
+        cloud_event.get("id"),
+    )
 
     if not bucket or not name:
         logger.warning("Missing bucket/name in event payload. data=%s", data)
         return ("OK", 200)
 
-    # idempotency on ingestion table
-    if _already_done(bucket, name, generation):
-        logger.info("SKIP already DONE: %s/%s gen=%s", bucket, name, generation)
-        return ("OK", 200)
+    # Route A) UPLOAD_BUCKET XLSX
+    if bucket == UPLOAD_BUCKET:
+        # ingestion table idempotency는 XLSX에만 적용
+        if _already_done(bucket, name, generation):
+            logger.info("SKIP already DONE: %s/%s gen=%s", bucket, name, generation)
+            return ("OK", 200)
 
-    _mark_ingestion("STARTED", bucket, name, generation)
+        _mark_ingestion("STARTED", bucket, name, generation)
+        try:
+            handle_xlsx_upload_event(bucket, name, generation)
+            return ("OK", 200)
+        except Exception as e:
+            logger.exception("FAILED upload %s/%s gen=%s", bucket, name, generation)
+            _mark_ingestion("FAILED", bucket, name, generation, error_message=str(e)[:5000])
+            return ("ERROR", 500)
 
-    try:
-        handle_xlsx_upload_event(bucket, name, generation)
-        return ("OK", 200)
+    # Route B) ARCHIVE_BUCKET batch_outputs
+    if bucket == ARCHIVE_BUCKET:
+        try:
+            handle_batch_output_event(bucket, name, generation)
+            return ("OK", 200)
+        except Exception:
+            logger.exception("FAILED batch output %s/%s gen=%s", bucket, name, generation)
+            return ("ERROR", 500)
 
-    except Exception as e:
-        logger.exception("FAILED upload %s/%s gen=%s", bucket, name, generation)
-        _mark_ingestion("FAILED", bucket, name, generation, error_message=str(e)[:5000])
-        return ("ERROR", 500)
+    logger.info("SKIP unknown bucket route bucket=%s name=%s", bucket, name)
+    return ("OK", 200)
