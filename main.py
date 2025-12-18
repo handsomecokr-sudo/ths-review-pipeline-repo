@@ -405,53 +405,71 @@ def _merge_reviews_clean_fixed_staging(df_std: pd.DataFrame):
 
     # ✅ MERGE: review_seq는 STRING 그대로
     merge_sql = f"""
-    MERGE `{TABLE_CLEAN}` T
-    USING (
-      SELECT * EXCEPT(rn)
-      FROM (
-        SELECT
-          S.*,
-          ROW_NUMBER() OVER (PARTITION BY review_key ORDER BY loaded_at DESC) AS rn
-        FROM `{STG_CLEAN}` S
-      )
-      WHERE rn = 1
-    ) S
-    ON T.review_key = S.review_key
-    WHEN MATCHED THEN UPDATE SET
-      review_no = S.review_no,
-      review_seq = S.review_seq,
-      channel = S.channel,
-      brand_no = S.brand_no,
-      product_no = S.product_no,
-      write_date = SAFE_CAST(NULLIF(TRIM(S.write_date), '') AS DATE),
-      review_score = SAFE_CAST(NULLIF(TRIM(S.review_score), '') AS INT64),
-      review_1depth = S.review_1depth,
-      review_2depth = S.review_2depth,
-      review_contents = S.review_contents,
-      review_text_masked = S.review_text_masked,
-      normalized_text = S.normalized_text,
-      legacy_review_ai_score = SAFE_CAST(NULLIF(TRIM(S.legacy_review_ai_score), '') AS FLOAT64),
-      legacy_review_ai_contents = S.legacy_review_ai_contents,
-      loaded_at = SAFE_CAST(NULLIF(TRIM(S.loaded_at), '') AS TIMESTAMP)
-    WHEN NOT MATCHED THEN
-      INSERT (
-        review_key, review_no, review_seq, channel, brand_no, product_no,
-        write_date, review_score, review_1depth, review_2depth,
-        review_contents, review_text_masked, normalized_text,
-        legacy_review_ai_score, legacy_review_ai_contents, loaded_at
-      )
-      VALUES (
-        S.review_key, S.review_no, S.review_seq,
-        S.channel, S.brand_no, S.product_no,
-        SAFE_CAST(NULLIF(TRIM(S.write_date), '') AS DATE),
-        SAFE_CAST(NULLIF(TRIM(S.review_score), '') AS INT64),
-        S.review_1depth, S.review_2depth,
-        S.review_contents, S.review_text_masked, S.normalized_text,
-        SAFE_CAST(NULLIF(TRIM(S.legacy_review_ai_score), '') AS FLOAT64),
-        S.legacy_review_ai_contents,
-        SAFE_CAST(NULLIF(TRIM(S.loaded_at), '') AS TIMESTAMP)
-      )
-    """
+        MERGE `{TABLE_CLEAN}` T
+        USING (
+        SELECT * EXCEPT(rn)
+        FROM (
+            SELECT
+            S.*,
+            ROW_NUMBER() OVER (PARTITION BY review_key ORDER BY CAST(loaded_at AS STRING) DESC) AS rn
+            FROM `{STG_CLEAN}` S
+        )
+        WHERE rn = 1
+        ) S
+        ON T.review_key = S.review_key
+        WHEN MATCHED THEN UPDATE SET
+        review_no = CAST(S.review_no AS STRING),
+        review_seq = CAST(S.review_seq AS STRING),
+        channel = CAST(S.channel AS STRING),
+        brand_no = CAST(S.brand_no AS STRING),
+        product_no = CAST(S.product_no AS STRING),
+
+        write_date = SAFE_CAST(NULLIF(CAST(S.write_date AS STRING), '') AS DATE),
+        review_score = SAFE_CAST(NULLIF(CAST(S.review_score AS STRING), '') AS INT64),
+
+        review_1depth = CAST(S.review_1depth AS STRING),
+        review_2depth = CAST(S.review_2depth AS STRING),
+
+        review_contents = CAST(S.review_contents AS STRING),
+        review_text_masked = CAST(S.review_text_masked AS STRING),
+        normalized_text = CAST(S.normalized_text AS STRING),
+
+        legacy_review_ai_score = SAFE_CAST(NULLIF(CAST(S.legacy_review_ai_score AS STRING), '') AS FLOAT64),
+        legacy_review_ai_contents = CAST(S.legacy_review_ai_contents AS STRING),
+
+        loaded_at = SAFE_CAST(NULLIF(CAST(S.loaded_at AS STRING), '') AS TIMESTAMP)
+
+        WHEN NOT MATCHED THEN
+        INSERT (
+            review_key, review_no, review_seq, channel, brand_no, product_no,
+            write_date, review_score, review_1depth, review_2depth,
+            review_contents, review_text_masked, normalized_text,
+            legacy_review_ai_score, legacy_review_ai_contents, loaded_at
+        )
+        VALUES (
+            CAST(S.review_key AS STRING),
+            CAST(S.review_no AS STRING),
+            CAST(S.review_seq AS STRING),
+            CAST(S.channel AS STRING),
+            CAST(S.brand_no AS STRING),
+            CAST(S.product_no AS STRING),
+
+            SAFE_CAST(NULLIF(CAST(S.write_date AS STRING), '') AS DATE),
+            SAFE_CAST(NULLIF(CAST(S.review_score AS STRING), '') AS INT64),
+            CAST(S.review_1depth AS STRING),
+            CAST(S.review_2depth AS STRING),
+
+            CAST(S.review_contents AS STRING),
+            CAST(S.review_text_masked AS STRING),
+            CAST(S.normalized_text AS STRING),
+
+            SAFE_CAST(NULLIF(CAST(S.legacy_review_ai_score AS STRING), '') AS FLOAT64),
+            CAST(S.legacy_review_ai_contents AS STRING),
+
+            SAFE_CAST(NULLIF(CAST(S.loaded_at AS STRING), '') AS TIMESTAMP)
+        )
+        """
+
     client.query(merge_sql).result()
     logger.info("BQ MERGE reviews_clean done rows=%d (seq=STRING)", len(rows))
 
