@@ -5,19 +5,19 @@ import re
 import uuid
 import zipfile
 from datetime import datetime, timezone
+from typing import Dict, List, Tuple
 
 import functions_framework
 import pandas as pd
 from cloudevents.http import CloudEvent
-import google.auth
 
+import google.auth
 from google.cloud import bigquery
 from google.cloud import storage
 
-# Vertex AI Batch (google-genai)
+# Vertex AI Batch (Google Gen AI SDK)
 from google import genai
 from google.genai.types import CreateBatchJobConfig, HttpOptions
-from google.genai import errors as genai_errors
 
 # -----------------------------
 # Logging
@@ -25,9 +25,8 @@ from google.genai import errors as genai_errors
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("review-pipeline")
 
-
 # -----------------------------
-# Config (Project ID 안전하게 가져오기)
+# Config
 # -----------------------------
 def _get_project_id() -> str:
     env_pid = (
@@ -38,60 +37,38 @@ def _get_project_id() -> str:
     )
     if env_pid:
         return env_pid
-
     _, pid = google.auth.default()
     if not pid:
-        raise RuntimeError(
-            "Project ID를 찾지 못했습니다. Cloud Run에 PROJECT_ID(또는 GOOGLE_CLOUD_PROJECT) env를 설정하세요."
-        )
+        raise RuntimeError("Project ID를 찾지 못했습니다. Cloud Run env에 GOOGLE_CLOUD_PROJECT 설정 권장")
     return pid
-
 
 PROJECT_ID = _get_project_id()
 DATASET = os.getenv("BQ_DATASET", "ths_review_analytics")
 
+UPLOAD_BUCKET = os.getenv("UPLOAD_BUCKET", "ths-review-upload-bkt")
+ARCHIVE_BUCKET = os.getenv("ARCHIVE_BUCKET", "ths-review-archive-bkt")
+
+BATCH_INPUT_PREFIX = os.getenv("BATCH_INPUT_PREFIX", "batch_inputs").strip("/")
+BATCH_OUTPUT_PREFIX = os.getenv("BATCH_OUTPUT_PREFIX", "batch_outputs").strip("/")
+
+PROMPT_VERSION = os.getenv("PROMPT_VERSION", "v1")
+
+VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "global")
+VERTEX_GEMINI_MODEL = os.getenv("VERTEX_GEMINI_MODEL", "gemini-2.0-flash-lite-001")
+
+# Tables
 TABLE_INGEST = f"{PROJECT_ID}.{DATASET}.ingestion_files"
 TABLE_RAW = f"{PROJECT_ID}.{DATASET}.reviews_raw"
 TABLE_CLEAN = f"{PROJECT_ID}.{DATASET}.reviews_clean"
+TABLE_EXTRACT = f"{PROJECT_ID}.{DATASET}.review_llm_extract"
+TABLE_METRICS = f"{PROJECT_ID}.{DATASET}.style_daily_metrics"
 
-# ✅ 고정 staging 테이블(폭증 방지)
-TABLE_STAGING_CLEAN = f"{PROJECT_ID}.{DATASET}.staging_reviews_clean"
+# 고정 staging 테이블(폭증 방지)
+STG_CLEAN = f"{PROJECT_ID}.{DATASET}.staging_reviews_clean"
+STG_EXTRACT = f"{PROJECT_ID}.{DATASET}.staging_review_llm_extract"
+STG_KEYS = f"{PROJECT_ID}.{DATASET}.staging_new_extract_keys"
 
-# -----------------------------
-# Bucket split (중요)
-# -----------------------------
-# 업로드(트리거 대상): 엑셀만 들어오는 곳
-UPLOAD_BUCKET = os.getenv("UPLOAD_BUCKET", "ths-review-upload-bkt")
-
-# 아카이브(결과 저장): batch_inputs / batch_outputs 저장 (트리거 대상 아님 권장)
-ARCHIVE_BUCKET = os.getenv("ARCHIVE_BUCKET", "ths-review-archive-bkt")
-
-# 결과물 prefix
-BATCH_INPUT_PREFIX = os.getenv("BATCH_INPUT_PREFIX", "batch_inputs")
-BATCH_OUTPUT_PREFIX = os.getenv("BATCH_OUTPUT_PREFIX", f"gs://{ARCHIVE_BUCKET}/batch_outputs")
-
-# 업로드 파일명 패턴(기본: review_yyyymmdd.xlsx)
-UPLOAD_XLSX_PATTERN = os.getenv("UPLOAD_XLSX_PATTERN", r"^review_\d{8}\.xlsx$")
-
-# -----------------------------
-# Model / Vertex Batch (global 강제)
-# -----------------------------
-# 기본 모델(원하면 env로 교체)
-VERTEX_GEMINI_MODEL = os.getenv("VERTEX_GEMINI_MODEL", "gemini-2.5-flash-lite")
-
-# 404 대비 fallback (동작하는 모델로 순차 재시도)
-MODEL_FALLBACKS = [
-    VERTEX_GEMINI_MODEL,
-    os.getenv("VERTEX_GEMINI_MODEL_FALLBACK1", "gemini-2.5-flash"),
-    os.getenv("VERTEX_GEMINI_MODEL_FALLBACK2", "gemini-2.0-flash"),
-]
-
-# Batch는 global endpoint 사용
-GENAI_LOCATION = "global"
-
-# -----------------------------
-# 엑셀 헤더(한글) -> 표준 컬럼명(BQ)
-# -----------------------------
+# Excel header mapping
 EXCEL_TO_STD = {
     "상품평작성일자": "write_date",
     "상품평리뷰번호": "review_no",
@@ -122,42 +99,117 @@ EXPECTED_STD_COLS = [
     "review_ai_contents",
 ]
 
-
 # -----------------------------
-# Clients
+# Clients / utils
 # -----------------------------
 def _bq() -> bigquery.Client:
     return bigquery.Client(project=PROJECT_ID)
 
-
 def _gcs() -> storage.Client:
     return storage.Client(project=PROJECT_ID)
-
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+def _iso_ts(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat()
+
+def _ensure_table(table_id: str, schema: List[bigquery.SchemaField], partition_field: str = None):
+    client = _bq()
+    try:
+        client.get_table(table_id)
+        return
+    except Exception:
+        pass
+
+    t = bigquery.Table(table_id, schema=schema)
+    if partition_field:
+        t.time_partitioning = bigquery.TimePartitioning(
+            type_=bigquery.TimePartitioningType.DAY,
+            field=partition_field,
+        )
+    client.create_table(t)
+    logger.info("Created table: %s", table_id)
+
+def _init_staging_tables():
+    # staging_reviews_clean: reviews_clean과 동일한 스키마
+    clean_schema = [
+        bigquery.SchemaField("review_key", "STRING"),
+        bigquery.SchemaField("review_no", "STRING"),
+        bigquery.SchemaField("review_seq", "INT64"),
+        bigquery.SchemaField("channel", "STRING"),
+        bigquery.SchemaField("brand_no", "STRING"),
+        bigquery.SchemaField("product_no", "STRING"),
+        bigquery.SchemaField("write_date", "DATE"),
+        bigquery.SchemaField("review_score", "INT64"),
+        bigquery.SchemaField("review_1depth", "STRING"),
+        bigquery.SchemaField("review_2depth", "STRING"),
+        bigquery.SchemaField("review_contents", "STRING"),
+        bigquery.SchemaField("review_text_masked", "STRING"),
+        bigquery.SchemaField("normalized_text", "STRING"),
+        bigquery.SchemaField("legacy_review_ai_score", "FLOAT64"),
+        bigquery.SchemaField("legacy_review_ai_contents", "STRING"),
+        bigquery.SchemaField("loaded_at", "TIMESTAMP"),
+    ]
+    extract_schema = [
+        bigquery.SchemaField("review_key", "STRING"),
+        bigquery.SchemaField("extracted_at", "TIMESTAMP"),
+        bigquery.SchemaField("model_name", "STRING"),
+        bigquery.SchemaField("model_version", "STRING"),
+        bigquery.SchemaField("brand_no", "STRING"),
+        bigquery.SchemaField("product_no", "STRING"),
+        bigquery.SchemaField("issue_category", "STRING"),
+        bigquery.SchemaField("severity", "STRING"),
+        bigquery.SchemaField("sentiment", "STRING"),
+        bigquery.SchemaField("size_feedback", "STRING"),
+        bigquery.SchemaField("defect_part", "STRING"),
+        bigquery.SchemaField("color_mentioned", "STRING"),
+        bigquery.SchemaField("repurchase_intent", "STRING"),
+        bigquery.SchemaField("evidence", "STRING"),
+        bigquery.SchemaField("raw_json", "JSON"),
+        bigquery.SchemaField("prompt_version", "STRING"),
+    ]
+    keys_schema = [bigquery.SchemaField("review_key", "STRING")]
+
+    _ensure_table(STG_CLEAN, clean_schema)
+    _ensure_table(STG_EXTRACT, extract_schema)
+    _ensure_table(STG_KEYS, keys_schema)
+
+def _ndjson_write(path: str, rows: List[dict]):
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+def _load_ndjson_to_table(table_id: str, ndjson_path: str, write_disposition: str):
+    client = _bq()
+    with open(ndjson_path, "rb") as fp:
+        job = client.load_table_from_file(
+            fp,
+            table_id,
+            job_config=bigquery.LoadJobConfig(
+                source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+                write_disposition=write_disposition,
+            ),
+        )
+    job.result()
 
 # -----------------------------
-# XLSX 검증
+# XLSX validation
 # -----------------------------
 def _assert_xlsx(local_path: str, object_name: str):
     if not object_name.lower().endswith(".xlsx"):
         raise ValueError(f"Not an .xlsx file: {object_name}")
 
-    # xlsx는 zip 컨테이너 → "PK" signature 체크
     with open(local_path, "rb") as f:
         sig = f.read(2)
     if sig != b"PK":
         raise ValueError("Uploaded file is not a valid .xlsx (zip header 'PK' not found)")
 
-    # zip 무결성 체크
     try:
         with zipfile.ZipFile(local_path, "r") as zf:
             _ = zf.namelist()[:1]
     except zipfile.BadZipFile:
         raise ValueError("Uploaded file is not a valid .xlsx (bad zip archive)")
-
 
 # -----------------------------
 # Ingestion idempotency / safety
@@ -181,14 +233,7 @@ def _already_done(bucket: str, object_name: str, generation: str) -> bool:
     rows = list(client.query(sql, job_config=job_config).result())
     return bool(rows) and rows[0]["status"] == "DONE"
 
-
-def _mark_ingestion(
-    status: str,
-    bucket: str,
-    object_name: str,
-    generation: str,
-    error_message: str = None,
-):
+def _mark_ingestion(status: str, bucket: str, object_name: str, generation: str, error_message: str = None):
     client = _bq()
     sql = f"""
     INSERT INTO `{TABLE_INGEST}` (bucket, object_name, generation, received_at, status, error_message)
@@ -206,9 +251,7 @@ def _mark_ingestion(
     )
     client.query(sql, job_config=job_config).result()
 
-
 def _raw_already_loaded(bucket: str, object_name: str, generation: str) -> bool:
-    """재시도 시 reviews_raw 중복 append 방지"""
     client = _bq()
     sql = f"""
     SELECT 1
@@ -226,102 +269,96 @@ def _raw_already_loaded(bucket: str, object_name: str, generation: str) -> bool:
     rows = list(client.query(sql, job_config=job_config).result())
     return bool(rows)
 
-
 # -----------------------------
-# GCS + Excel load
+# GCS IO
 # -----------------------------
-def _download_xlsx(bucket: str, name: str) -> str:
-    local_path = f"/tmp/{uuid.uuid4().hex}.xlsx"
-    client = _gcs()
-    blob = client.bucket(bucket).blob(name)
-    blob.download_to_filename(local_path)
+def _download_to_tmp(bucket: str, name: str) -> str:
+    local_path = f"/tmp/{uuid.uuid4().hex}_{os.path.basename(name)}"
+    gcs = _gcs()
+    gcs.bucket(bucket).blob(name).download_to_filename(local_path)
     return local_path
 
+def _upload_file(bucket: str, blob_name: str, local_path: str, content_type: str = None) -> str:
+    gcs = _gcs()
+    b = gcs.bucket(bucket).blob(blob_name)
+    b.upload_from_filename(local_path, content_type=content_type)
+    return f"gs://{bucket}/{blob_name}"
 
+# -----------------------------
+# Excel load
+# -----------------------------
 def _load_excel_mapped(path: str) -> pd.DataFrame:
     df = pd.read_excel(path, engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
-
     df = df.rename(columns=EXCEL_TO_STD)
 
     missing = [c for c in EXPECTED_STD_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"컬럼 매핑 후 누락: {missing}. 현재 컬럼={list(df.columns)}")
 
-    return df[EXPECTED_STD_COLS].copy()
-
+    df = df[EXPECTED_STD_COLS].copy()
+    return df
 
 # -----------------------------
-# BigQuery writes
+# BigQuery writes (NDJSON 방식: pyarrow 불필요)
 # -----------------------------
 def _append_reviews_raw(df_std: pd.DataFrame, bucket: str, name: str, generation: str):
-    """
-    reviews_raw는 STRING 위주(loaded_at만 TIMESTAMP)
-    """
-    client = _bq()
     loaded_at = _now_utc()
     ingest_id = uuid.uuid4().hex
 
-    df = df_std.copy()
+    rows = []
+    for _, r in df_std.iterrows():
+        rows.append(
+            {
+                "ingest_id": ingest_id,
+                "source_bucket": bucket,
+                "source_object": name,
+                "source_generation": generation,
+                "loaded_at": _iso_ts(loaded_at),
 
-    df_raw = pd.DataFrame(
-        {
-            "ingest_id": ingest_id,
-            "source_bucket": bucket,
-            "source_object": name,
-            "source_generation": generation,
-            "loaded_at": loaded_at,
-            "write_date": df["write_date"].astype(str),
-            "review_no": df["review_no"].astype(str),
-            "review_seq": df["review_seq"].astype(str),
-            "channel": df["channel"].astype(str),
-            "brand_no": df["brand_no"].astype(str),
-            "product_no": df["product_no"].astype(str),
-            "review_1depth": df["review_1depth"].astype(str),
-            "review_2depth": df["review_2depth"].astype(str),
-            "review_score": df["review_score"].astype(str),
-            "review_contents": df["review_contents"].astype(str),
-            "review_ai_score": df["review_ai_score"].astype(str),
-            "review_ai_contents": df["review_ai_contents"].astype(str),
-        }
-    )
+                "write_date": "" if pd.isna(r["write_date"]) else str(r["write_date"]),
+                "review_no": "" if pd.isna(r["review_no"]) else str(r["review_no"]),
+                "review_seq": "" if pd.isna(r["review_seq"]) else str(r["review_seq"]),
+                "channel": "" if pd.isna(r["channel"]) else str(r["channel"]),
+                "brand_no": "" if pd.isna(r["brand_no"]) else str(r["brand_no"]),
+                "product_no": "" if pd.isna(r["product_no"]) else str(r["product_no"]),
+                "review_1depth": "" if pd.isna(r["review_1depth"]) else str(r["review_1depth"]),
+                "review_2depth": "" if pd.isna(r["review_2depth"]) else str(r["review_2depth"]),
+                "review_score": "" if pd.isna(r["review_score"]) else str(r["review_score"]),
+                "review_contents": "" if pd.isna(r["review_contents"]) else str(r["review_contents"]),
+                "review_ai_score": "" if pd.isna(r["review_ai_score"]) else str(r["review_ai_score"]),
+                "review_ai_contents": "" if pd.isna(r["review_ai_contents"]) else str(r["review_ai_contents"]),
+            }
+        )
 
-    job = client.load_table_from_dataframe(
-        df_raw,
-        TABLE_RAW,
-        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND"),
-    )
-    job.result()
-    logger.info("BQ append reviews_raw rows=%d ingest_id=%s", len(df_raw), ingest_id)
+    tmp = f"/tmp/raw_{uuid.uuid4().hex}.ndjson"
+    _ndjson_write(tmp, rows)
+    _load_ndjson_to_table(TABLE_RAW, tmp, write_disposition="WRITE_APPEND")
+    logger.info("BQ append reviews_raw rows=%d ingest_id=%s", len(rows), ingest_id)
 
-
-def _merge_reviews_clean(df_std: pd.DataFrame):
+def _merge_reviews_clean_fixed_staging(df_std: pd.DataFrame):
     """
-    ✅ 고정 staging 테이블 방식 (테이블 폭증 방지)
-    - staging_reviews_clean을 WRITE_TRUNCATE로 덮어쓰고 MERGE
-    - MERGE 소스는 ROW_NUMBER로 review_key당 1행만 남김(중복으로 MERGE 에러 방지)
-    - review_seq/write_date 파싱 실패 행은 drop(0으로 몰지 않음)
+    고정 staging 테이블 1개(STG_CLEAN)만 사용:
+    - 파싱 실패 행 drop
+    - staging 내 review_key 중복은 ROW_NUMBER로 1개만 남겨 MERGE 안정화
     """
     client = _bq()
     loaded_at = _now_utc()
 
     df = df_std.copy()
 
-    # 1) 안전 파싱
     df["review_no"] = df["review_no"].astype(str).str.strip()
-
     df["review_seq_num"] = pd.to_numeric(df["review_seq"], errors="coerce")
     df["review_score_num"] = pd.to_numeric(df["review_score"], errors="coerce")
     df["write_date_dt"] = pd.to_datetime(df["write_date"], errors="coerce").dt.date
 
-    # 필수키 파싱 실패 행 제거
     before = len(df)
     df = df[df["review_no"].notna() & (df["review_no"] != "")]
     df = df[df["review_seq_num"].notna()]
     df = df[df["write_date_dt"].notna()]
     dropped = before - len(df)
-    if dropped > 0:
-        logger.warning("DROP rows due to invalid keys/parse (count=%d)", dropped)
+    if dropped:
+        logger.warning("DROP invalid rows (count=%d)", dropped)
 
     if len(df) == 0:
         logger.info("No valid rows to merge into reviews_clean")
@@ -330,44 +367,39 @@ def _merge_reviews_clean(df_std: pd.DataFrame):
     df["review_seq"] = df["review_seq_num"].astype(int)
     df["review_score"] = df["review_score_num"].fillna(0).astype(int)
     df["write_date"] = df["write_date_dt"]
-
     df["review_key"] = df["review_no"] + "-" + df["review_seq"].astype(str)
 
-    # MVP: 아직 DLP 마스킹 전 → 원문을 그대로 사용
+    # MVP: DLP 전이라 원문을 그대로 masked로
     df["review_text_masked"] = df["review_contents"].astype(str)
     df["normalized_text"] = df["review_contents"].astype(str)
 
-    # 2) staging dataframe 구성
-    df_stage = pd.DataFrame(
-        {
-            "review_key": df["review_key"].astype(str),
-            "review_no": df["review_no"].astype(str),
-            "review_seq": df["review_seq"].astype(int),
-            "channel": df["channel"].astype(str),
-            "brand_no": df["brand_no"].astype(str),
-            "product_no": df["product_no"].astype(str),
-            "write_date": df["write_date"],
-            "review_score": df["review_score"].astype(int),
-            "review_1depth": df["review_1depth"].astype(str),
-            "review_2depth": df["review_2depth"].astype(str),
-            "review_contents": df["review_contents"].astype(str),
-            "review_text_masked": df["review_text_masked"].astype(str),
-            "normalized_text": df["normalized_text"].astype(str),
-            "legacy_review_ai_score": pd.to_numeric(df["review_ai_score"], errors="coerce"),
-            "legacy_review_ai_contents": df["review_ai_contents"].astype(str),
-            "loaded_at": loaded_at,
-        }
-    )
+    rows = []
+    for _, r in df.iterrows():
+        rows.append(
+            {
+                "review_key": str(r["review_key"]),
+                "review_no": str(r["review_no"]),
+                "review_seq": int(r["review_seq"]),
+                "channel": "" if pd.isna(r["channel"]) else str(r["channel"]),
+                "brand_no": "" if pd.isna(r["brand_no"]) else str(r["brand_no"]),
+                "product_no": "" if pd.isna(r["product_no"]) else str(r["product_no"]),
+                "write_date": str(r["write_date"]),
+                "review_score": int(r["review_score"]),
+                "review_1depth": "" if pd.isna(r["review_1depth"]) else str(r["review_1depth"]),
+                "review_2depth": "" if pd.isna(r["review_2depth"]) else str(r["review_2depth"]),
+                "review_contents": "" if pd.isna(r["review_contents"]) else str(r["review_contents"]),
+                "review_text_masked": "" if pd.isna(r["review_text_masked"]) else str(r["review_text_masked"]),
+                "normalized_text": "" if pd.isna(r["normalized_text"]) else str(r["normalized_text"]),
+                "legacy_review_ai_score": None if pd.isna(r["review_ai_score"]) else float(r["review_ai_score"]) if str(r["review_ai_score"]).strip() != "" else None,
+                "legacy_review_ai_contents": "" if pd.isna(r["review_ai_contents"]) else str(r["review_ai_contents"]),
+                "loaded_at": _iso_ts(loaded_at),
+            }
+        )
 
-    # 3) 고정 staging 테이블로 로드(TRUNCATE)
-    client.load_table_from_dataframe(
-        df_stage,
-        TABLE_STAGING_CLEAN,
-        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE"),
-    ).result()
-    logger.info("BQ load staging_reviews_clean rows=%d", len(df_stage))
+    tmp = f"/tmp/clean_stage_{uuid.uuid4().hex}.ndjson"
+    _ndjson_write(tmp, rows)
+    _load_ndjson_to_table(STG_CLEAN, tmp, write_disposition="WRITE_TRUNCATE")
 
-    # 4) MERGE (소스 중복 방지)
     merge_sql = f"""
     MERGE `{TABLE_CLEAN}` T
     USING (
@@ -376,7 +408,7 @@ def _merge_reviews_clean(df_std: pd.DataFrame):
         SELECT
           S.*,
           ROW_NUMBER() OVER (PARTITION BY review_key ORDER BY loaded_at DESC) AS rn
-        FROM `{TABLE_STAGING_CLEAN}` S
+        FROM `{STG_CLEAN}` S
       )
       WHERE rn = 1
     ) S
@@ -401,18 +433,17 @@ def _merge_reviews_clean(df_std: pd.DataFrame):
       INSERT ROW
     """
     client.query(merge_sql).result()
-    logger.info("BQ MERGE reviews_clean done rows=%d", len(df_stage))
-
+    logger.info("BQ MERGE reviews_clean done rows=%d", len(rows))
 
 # -----------------------------
-# Batch input(JSONL) builder
+# Build batch input JSONL
 # -----------------------------
 SQL_NEW_REVIEWS_FOR_FILE = f"""
 WITH file_rows AS (
   SELECT DISTINCT
     review_no,
     SAFE_CAST(review_seq AS INT64) AS review_seq
-  FROM `{PROJECT_ID}.{DATASET}.reviews_raw`
+  FROM `{TABLE_RAW}`
   WHERE source_bucket = @bucket
     AND source_object = @object_name
     AND source_generation = @generation
@@ -424,18 +455,17 @@ targets AS (
     c.product_no,
     c.channel,
     c.review_text_masked
-  FROM `{PROJECT_ID}.{DATASET}.reviews_clean` c
+  FROM `{TABLE_CLEAN}` c
   JOIN file_rows r
     ON c.review_no = r.review_no
    AND c.review_seq = r.review_seq
 )
 SELECT t.*
 FROM targets t
-LEFT JOIN `{PROJECT_ID}.{DATASET}.review_llm_extract` e
+LEFT JOIN `{TABLE_EXTRACT}` e
   ON e.review_key = t.review_key
 WHERE e.review_key IS NULL
 """
-
 
 def _build_prompt(row: dict) -> str:
     review_text = (row.get("review_text_masked") or "").strip()
@@ -476,17 +506,12 @@ def _build_prompt(row: dict) -> str:
 {review_text}
 """.strip()
 
-
-def make_batch_input_jsonl_and_upload(source_bucket: str, object_name: str, generation: str) -> str:
-    """
-    ✅ JSONL은 반드시 ARCHIVE_BUCKET에 저장 (UPLOAD_BUCKET에 저장하면 재귀 트리거)
-    """
+def make_batch_input_jsonl_and_upload(bucket: str, object_name: str, generation: str) -> str:
     bq = _bq()
-    gcs = _gcs()
 
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
-            bigquery.ScalarQueryParameter("bucket", "STRING", source_bucket),
+            bigquery.ScalarQueryParameter("bucket", "STRING", bucket),
             bigquery.ScalarQueryParameter("object_name", "STRING", object_name),
             bigquery.ScalarQueryParameter("generation", "STRING", generation),
         ]
@@ -517,156 +542,333 @@ def make_batch_input_jsonl_and_upload(source_bucket: str, object_name: str, gene
         logger.info("BATCH INPUT: no targets (already analyzed or empty)")
         return ""
 
-    safe_name = object_name.replace("/", "_")
-    dest_blob = f"{BATCH_INPUT_PREFIX}/{safe_name}/{generation}/batch_input.jsonl"
-
-    gcs.bucket(ARCHIVE_BUCKET).blob(dest_blob).upload_from_filename(
-        tmp_path, content_type="application/jsonl"
+    dest_blob = f"{BATCH_INPUT_PREFIX}/{object_name}/{generation}/batch_input.jsonl"
+    input_uri = _upload_file(
+        ARCHIVE_BUCKET,
+        dest_blob,
+        tmp_path,
+        content_type="application/jsonl",
     )
-
-    input_uri = f"gs://{ARCHIVE_BUCKET}/{dest_blob}"
     logger.info("BATCH INPUT uploaded: %s (rows=%d)", input_uri, rows_written)
     return input_uri
 
-
 # -----------------------------
-# Vertex AI Batch submit (global 강제 + model fallback)
+# Vertex AI Batch submit (global)
 # -----------------------------
-def _create_genai_client_global() -> genai.Client:
-    # 문서 예시 스타일: env로 VertexAI 사용 + global
-    os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "True"
-    os.environ["GOOGLE_CLOUD_PROJECT"] = PROJECT_ID
-    os.environ["GOOGLE_CLOUD_LOCATION"] = GENAI_LOCATION
-
-    return genai.Client(http_options=HttpOptions(api_version="v1"))
-
+def _normalize_model_name(model: str) -> str:
+    """
+    모델명이 짧게 들어와도 batches.create에서 안정적으로 찾도록 publisher 경로로 정규화.
+    """
+    m = (model or "").strip()
+    if not m:
+        return "publishers/google/models/gemini-2.0-flash-lite-001"
+    if m.startswith("publishers/"):
+        return m
+    # gemini-xxx 형태면 publisher 경로로
+    if re.match(r"^gemini-[\w\.\-]+$", m):
+        return f"publishers/google/models/{m}"
+    return m
 
 def submit_vertex_batch_job_global(input_jsonl_gcs_uri: str, object_name: str, generation: str) -> str:
     if not input_jsonl_gcs_uri:
         return ""
 
-    safe_name = object_name.replace("/", "_")
-    output_prefix = BATCH_OUTPUT_PREFIX.rstrip("/") + f"/{safe_name}/{generation}/"
+    model_name = _normalize_model_name(VERTEX_GEMINI_MODEL)
 
-    client = _create_genai_client_global()
+    # output은 archive bucket 아래로 고정
+    output_prefix = f"gs://{ARCHIVE_BUCKET}/{BATCH_OUTPUT_PREFIX}/{object_name}/{generation}/"
 
-    tried = []
-    last_err = None
+    client = genai.Client(
+        vertexai=True,
+        project=PROJECT_ID,
+        location=VERTEX_LOCATION,
+        http_options=HttpOptions(api_version="v1"),
+    )
 
-    for model_id in MODEL_FALLBACKS:
-        if not model_id or model_id in tried:
-            continue
-        tried.append(model_id)
+    job = client.batches.create(
+        model=model_name,
+        src=input_jsonl_gcs_uri,
+        config=CreateBatchJobConfig(dest=output_prefix),
+    )
 
-        try:
-            job = client.batches.create(
-                model=model_id,
-                src=input_jsonl_gcs_uri,
-                config=CreateBatchJobConfig(dest=output_prefix),
-            )
-            job_name = getattr(job, "name", "") or str(job)
-            logger.info(
-                "BATCH SUBMITTED location=%s model=%s input=%s output=%s job=%s",
-                GENAI_LOCATION,
-                model_id,
-                input_jsonl_gcs_uri,
-                output_prefix,
-                job_name,
-            )
-            return job_name
+    job_name = getattr(job, "name", "") or str(job)
+    logger.info(
+        "BATCH SUBMITTED location=%s model=%s input=%s output=%s job=%s",
+        VERTEX_LOCATION,
+        model_name,
+        input_jsonl_gcs_uri,
+        output_prefix,
+        job_name,
+    )
+    return job_name
 
-        except genai_errors.ClientError as e:
-            last_err = e
-            msg = str(e)
-            logger.warning("Batch create failed model=%s err=%s", model_id, msg)
+# -----------------------------
+# Batch output(JSONL) parse -> BQ upsert -> metrics refresh
+# -----------------------------
+def _extract_text_from_batch_line(obj: dict) -> Tuple[str, str]:
+    """
+    returns (text, model_version)
+    batch output format: each line contains response or error. :contentReference[oaicite:3]{index=3}
+    """
+    resp = obj.get("response") or {}
+    mv = resp.get("modelVersion", "") or resp.get("model_version", "") or ""
+    candidates = resp.get("candidates") or []
+    if not candidates:
+        return "", mv
+    content = (candidates[0].get("content") or {})
+    parts = content.get("parts") or []
+    if not parts:
+        return "", mv
+    text = parts[0].get("text") or ""
+    return text, mv
 
-            # 404면 다음 모델로 fallback
-            if "404" in msg or "NOT_FOUND" in msg:
+def _parse_output_jsonl(local_path: str) -> Tuple[List[dict], List[str], List[str]]:
+    """
+    returns (extract_rows, review_keys, errors)
+    """
+    extracted_at = _now_utc()
+    rows: List[dict] = []
+    keys: List[str] = []
+    errors: List[str] = []
+
+    with open(local_path, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception as e:
+                errors.append(f"line{i}: invalid json: {e}")
                 continue
 
-            # 그 외(권한/쿼터/입력 포맷 등)는 즉시 raise
-            raise
+            if obj.get("error"):
+                errors.append(f"line{i}: error={obj.get('error')}")
+                continue
 
-    raise RuntimeError(f"All batch models failed. tried={tried} last_err={last_err}")
+            text, model_version = _extract_text_from_batch_line(obj)
+            if not text:
+                errors.append(f"line{i}: empty text")
+                continue
 
+            # model이 JSON만 출력하도록 시켰으므로 파싱
+            try:
+                payload = json.loads(text)
+            except Exception as e:
+                errors.append(f"line{i}: response not json: {e} text={text[:200]}")
+                continue
 
-# -----------------------------
-# CloudEvent handler
-# -----------------------------
-@functions_framework.cloud_event
-def ingest_from_gcs(cloud_event: CloudEvent):
-    data = cloud_event.data or {}
+            review_key = str(payload.get("review_key") or "").strip()
+            if not review_key:
+                errors.append(f"line{i}: missing review_key")
+                continue
 
-    bucket = data.get("bucket") or ""
-    name = data.get("name") or ""
-    generation = str(data.get("generation", ""))
+            signals = payload.get("signals") or {}
 
-    logger.info("EVENT bucket=%s name=%s generation=%s", bucket, name, generation)
+            row = {
+                "review_key": review_key,
+                "extracted_at": _iso_ts(extracted_at),
+                "model_name": _normalize_model_name(VERTEX_GEMINI_MODEL),
+                "model_version": model_version or "",
+                "brand_no": str(payload.get("brand_no") or ""),
+                "product_no": str(payload.get("product_no") or ""),
+                "issue_category": str(payload.get("issue_category") or ""),
+                "severity": str(payload.get("severity") or ""),
+                "sentiment": str(payload.get("sentiment") or ""),
+                "size_feedback": str(signals.get("size_feedback") or ""),
+                "defect_part": str(signals.get("defect_part") or ""),
+                "color_mentioned": str(signals.get("color_mentioned") or ""),
+                "repurchase_intent": str(signals.get("repurchase_intent") or ""),
+                "evidence": str(payload.get("evidence") or ""),
+                "raw_json": payload,   # JSON column
+                "prompt_version": PROMPT_VERSION,
+            }
+            rows.append(row)
+            keys.append(review_key)
 
-    # -----------------------------
-    # ✅ 0) 필터링 (재귀/잡파일 차단)
-    # -----------------------------
-    # 업로드 버킷만 처리
-    if bucket != UPLOAD_BUCKET:
-        logger.info("SKIP: bucket not upload bucket. bucket=%s expected=%s", bucket, UPLOAD_BUCKET)
-        return ("OK", 200)
+    return rows, keys, errors
 
-    # xlsx만 처리
-    if not name.lower().endswith(".xlsx"):
-        logger.info("SKIP: non-xlsx object: %s", name)
-        return ("OK", 200)
+def _upsert_review_llm_extract(rows: List[dict]):
+    if not rows:
+        return
 
-    # 파일명 패턴 체크(원치 않으면 env에서 빈값으로 비활성화 가능)
-    if UPLOAD_XLSX_PATTERN:
-        try:
-            if not re.match(UPLOAD_XLSX_PATTERN, name):
-                logger.info("SKIP: filename not match pattern. name=%s pattern=%s", name, UPLOAD_XLSX_PATTERN)
-                return ("OK", 200)
-        except re.error:
-            logger.warning("UPLOAD_XLSX_PATTERN invalid regex. pattern=%s (ignore)", UPLOAD_XLSX_PATTERN)
+    tmp = f"/tmp/extract_stage_{uuid.uuid4().hex}.ndjson"
+    _ndjson_write(tmp, rows)
+    _load_ndjson_to_table(STG_EXTRACT, tmp, write_disposition="WRITE_TRUNCATE")
 
-    # 혹시 업로드 버킷에 내부 prefix가 들어오면 차단
-    if name.startswith("batch_inputs/") or name.startswith("batch_outputs/"):
-        logger.info("SKIP: internal artifact in upload bucket: %s", name)
-        return ("OK", 200)
+    client = _bq()
+    merge_sql = f"""
+    MERGE `{TABLE_EXTRACT}` T
+    USING (
+      SELECT * EXCEPT(rn)
+      FROM (
+        SELECT
+          S.*,
+          ROW_NUMBER() OVER (PARTITION BY review_key, prompt_version ORDER BY extracted_at DESC) AS rn
+        FROM `{STG_EXTRACT}` S
+      )
+      WHERE rn = 1
+    ) S
+    ON T.review_key = S.review_key AND T.prompt_version = S.prompt_version
+    WHEN MATCHED THEN UPDATE SET
+      extracted_at = S.extracted_at,
+      model_name = S.model_name,
+      model_version = S.model_version,
+      brand_no = S.brand_no,
+      product_no = S.product_no,
+      issue_category = S.issue_category,
+      severity = S.severity,
+      sentiment = S.sentiment,
+      size_feedback = S.size_feedback,
+      defect_part = S.defect_part,
+      color_mentioned = S.color_mentioned,
+      repurchase_intent = S.repurchase_intent,
+      evidence = S.evidence,
+      raw_json = S.raw_json
+    WHEN NOT MATCHED THEN
+      INSERT ROW
+    """
+    client.query(merge_sql).result()
+    logger.info("Upserted review_llm_extract rows=%d", len(rows))
 
-    # -----------------------------
-    # ✅ 1) 멱등성 체크
-    # -----------------------------
+def _refresh_style_daily_metrics(keys: List[str]):
+    """
+    이번에 새로 적재된 review_key들이 속한 날짜 범위만 재집계하여 MERGE
+    """
+    if not keys:
+        return
+
+    # keys staging
+    key_rows = [{"review_key": k} for k in sorted(set(keys))]
+    tmp = f"/tmp/keys_{uuid.uuid4().hex}.ndjson"
+    _ndjson_write(tmp, key_rows)
+    _load_ndjson_to_table(STG_KEYS, tmp, write_disposition="WRITE_TRUNCATE")
+
+    client = _bq()
+
+    # BigQuery script: min/max date 구하고 해당 범위만 재집계
+    sql = f"""
+    DECLARE min_d DATE;
+    DECLARE max_d DATE;
+
+    SET (min_d, max_d) = (
+      SELECT AS STRUCT
+        MIN(c.write_date) AS min_d,
+        MAX(c.write_date) AS max_d
+      FROM `{TABLE_CLEAN}` c
+      JOIN `{STG_KEYS}` k
+        ON c.review_key = k.review_key
+    );
+
+    IF min_d IS NULL OR max_d IS NULL THEN
+      SELECT "NO_DATES" AS status;
+    ELSE
+      MERGE `{TABLE_METRICS}` T
+      USING (
+        SELECT
+          c.write_date AS metric_date,
+          c.brand_no,
+          c.product_no,
+          c.channel,
+          e.issue_category,
+          COUNT(1) AS review_cnt,
+          SUM(IF(e.sentiment="불만", 1, 0)) AS neg_cnt,
+          SUM(IF(e.severity="중대", 1, 0)) AS severe_cnt,
+          AVG(c.review_score) AS avg_rating
+        FROM `{TABLE_CLEAN}` c
+        JOIN `{TABLE_EXTRACT}` e
+          ON c.review_key = e.review_key
+        WHERE c.write_date BETWEEN min_d AND max_d
+        GROUP BY metric_date, brand_no, product_no, channel, issue_category
+      ) S
+      ON T.metric_date = S.metric_date
+        AND T.brand_no = S.brand_no
+        AND T.product_no = S.product_no
+        AND T.channel = S.channel
+        AND T.issue_category = S.issue_category
+      WHEN MATCHED THEN UPDATE SET
+        review_cnt = S.review_cnt,
+        neg_cnt = S.neg_cnt,
+        severe_cnt = S.severe_cnt,
+        avg_rating = S.avg_rating
+      WHEN NOT MATCHED THEN
+        INSERT ROW;
+    END IF;
+    """
+    client.query(sql).result()
+    logger.info("Refreshed style_daily_metrics for keys=%d", len(key_rows))
+
+def handle_batch_output_event(bucket: str, name: str, generation: str):
+    # output jsonl만 처리
+    if bucket != ARCHIVE_BUCKET:
+        logger.info("SKIP batch output: bucket mismatch %s", bucket)
+        return
+
+    if not name.startswith(f"{BATCH_OUTPUT_PREFIX}/") or not name.lower().endswith(".jsonl"):
+        logger.info("SKIP batch output: not target object %s", name)
+        return
+
+    # 중복 방지(ingestion_files 재활용)
     if _already_done(bucket, name, generation):
-        logger.info("SKIP already DONE: %s/%s gen=%s", bucket, name, generation)
-        return ("OK", 200)
+        logger.info("SKIP already DONE output: %s/%s gen=%s", bucket, name, generation)
+        return
 
     _mark_ingestion("STARTED", bucket, name, generation)
 
     try:
-        # 2) 다운로드
-        local_path = _download_xlsx(bucket, name)
+        local_path = _download_to_tmp(bucket, name)
+        # output은 jsonl이므로 xlsx 검증 없음
 
-        # 3) xlsx 검증
+        rows, keys, errors = _parse_output_jsonl(local_path)
+
+        if rows:
+            _upsert_review_llm_extract(rows)
+            _refresh_style_daily_metrics(keys)
+
+        msg = f"PARSED={len(rows)} ERRORS={len(errors)}"
+        if errors:
+            msg += " SAMPLE_ERR=" + (errors[0][:500] if errors else "")
+        _mark_ingestion("DONE", bucket, name, generation, error_message=msg)
+        logger.info("Batch output handled: %s (rows=%d errors=%d)", name, len(rows), len(errors))
+
+    except Exception as e:
+        logger.exception("FAILED batch output %s/%s gen=%s", bucket, name, generation)
+        _mark_ingestion("FAILED", bucket, name, generation, error_message=str(e)[:5000])
+        raise
+
+# -----------------------------
+# XLSX upload handler
+# -----------------------------
+def handle_xlsx_upload_event(bucket: str, name: str, generation: str):
+    if bucket != UPLOAD_BUCKET:
+        logger.info("SKIP upload: bucket mismatch %s", bucket)
+        return
+
+    # 업로드 버킷에서는 XLSX만 처리 (그 외 모두 스킵)
+    if not name.lower().endswith(".xlsx"):
+        logger.info("SKIP upload: not xlsx %s", name)
+        return
+
+    if _already_done(bucket, name, generation):
+        logger.info("SKIP already DONE: %s/%s gen=%s", bucket, name, generation)
+        return
+
+    _mark_ingestion("STARTED", bucket, name, generation)
+
+    try:
+        local_path = _download_to_tmp(bucket, name)
         _assert_xlsx(local_path, name)
 
-        # 4) 로드 & 매핑
         df_std = _load_excel_mapped(local_path)
 
-        # 5) raw 적재 (재시도 중복 방지)
         if not _raw_already_loaded(bucket, name, generation):
             _append_reviews_raw(df_std, bucket, name, generation)
         else:
             logger.info("SKIP reviews_raw already loaded for %s/%s gen=%s", bucket, name, generation)
 
-        # 6) clean merge (고정 staging 방식)
-        _merge_reviews_clean(df_std)
+        _merge_reviews_clean_fixed_staging(df_std)
 
-        # 7) batch input 생성 + 업로드(ARCHIVE_BUCKET)
         input_uri = make_batch_input_jsonl_and_upload(bucket, name, generation)
-
-        # 8) 대상 없으면 DONE만 찍고 종료(배치 제출 X)
-        if not input_uri:
-            _mark_ingestion("DONE", bucket, name, generation, error_message="NO_TARGETS")
-            return ("OK", 200)
-
-        # 9) batch job 제출(global 강제 + fallback)
         job_name = submit_vertex_batch_job_global(input_uri, name, generation)
 
         _mark_ingestion(
@@ -674,11 +876,52 @@ def ingest_from_gcs(cloud_event: CloudEvent):
             bucket,
             name,
             generation,
-            error_message=f"BATCH_JOB={job_name}",
+            error_message=(f"BATCH_JOB={job_name}" if job_name else "NO_TARGETS"),
         )
-        return ("OK", 200)
+        logger.info("Upload handled: %s (batch_job=%s)", name, job_name)
 
     except Exception as e:
-        logger.exception("FAILED processing %s/%s gen=%s", bucket, name, generation)
+        logger.exception("FAILED upload %s/%s gen=%s", bucket, name, generation)
         _mark_ingestion("FAILED", bucket, name, generation, error_message=str(e)[:5000])
+        raise
+
+# -----------------------------
+# CloudEvent entrypoint
+# -----------------------------
+@functions_framework.cloud_event
+def ingest_from_gcs(cloud_event: CloudEvent):
+    _init_staging_tables()
+
+    data = cloud_event.data or {}
+    bucket = data.get("bucket")
+    name = data.get("name")
+    generation = str(data.get("generation", ""))
+
+    logger.info("EVENT bucket=%s name=%s generation=%s", bucket, name, generation)
+    logger.info("EVENT type=%s source=%s id=%s", cloud_event.get("type"), cloud_event.get("source"), cloud_event.get("id"))
+
+    if not bucket or not name:
+        logger.warning("Missing bucket/name in event payload. data=%s", data)
+        return ("OK", 200)
+
+    try:
+        # 1) 업로드 XLSX 처리
+        if bucket == UPLOAD_BUCKET:
+            handle_xlsx_upload_event(bucket, name, generation)
+            return ("OK", 200)
+
+        # 2) Batch output 처리
+        if bucket == ARCHIVE_BUCKET:
+            # batch_inputs는 스킵(루프 방지)
+            if name.startswith(f"{BATCH_INPUT_PREFIX}/"):
+                logger.info("SKIP archive batch_inputs object: %s", name)
+                return ("OK", 200)
+            handle_batch_output_event(bucket, name, generation)
+            return ("OK", 200)
+
+        logger.info("SKIP: unrelated bucket=%s name=%s", bucket, name)
+        return ("OK", 200)
+
+    except Exception:
+        # 이미 _mark_ingestion FAILED 찍고 raise 했지만, Cloud Run 응답도 500으로
         return ("ERROR", 500)
