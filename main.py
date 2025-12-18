@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from google.cloud import storage
 # google genai (Vertex AI Batch)
 from google import genai
 from google.genai.types import CreateBatchJobConfig, HttpOptions
+from google.genai import errors as genai_errors
 
 # -----------------------------
 # Logging
@@ -51,23 +53,47 @@ TABLE_INGEST = f"{PROJECT_ID}.{DATASET}.ingestion_files"
 TABLE_RAW = f"{PROJECT_ID}.{DATASET}.reviews_raw"
 TABLE_CLEAN = f"{PROJECT_ID}.{DATASET}.reviews_clean"
 
-# Batch 관련 (모델은 env로 바꿀 수 있게)
-VERTEX_GEMINI_MODEL = os.getenv("VERTEX_GEMINI_MODEL", "gemini-2.5-flash-lite")
+# -----------------------------
+# Bucket split (중요)
+# -----------------------------
+# 업로드(트리거 대상) 버킷: 엑셀만 들어오는 곳
+UPLOAD_BUCKET = os.getenv("UPLOAD_BUCKET", "ths-review-upload-bkt")
 
-# JSONL 저장 버킷/프리픽스
-BATCH_BUCKET = os.getenv("BATCH_BUCKET", "ths-review-upload-bkt")
+# 아카이브(결과 저장) 버킷: batch_inputs / batch_outputs 저장 (트리거 X 권장)
+ARCHIVE_BUCKET = os.getenv("ARCHIVE_BUCKET", "ths-review-archive-bkt")
+
+# 결과물 prefix
 BATCH_INPUT_PREFIX = os.getenv("BATCH_INPUT_PREFIX", "batch_inputs")
-# output은 GCS prefix로 유지
-BATCH_OUTPUT_PREFIX = os.getenv("BATCH_OUTPUT_PREFIX", f"gs://{BATCH_BUCKET}/batch_outputs/")
+BATCH_OUTPUT_PREFIX = os.getenv("BATCH_OUTPUT_PREFIX", f"gs://{ARCHIVE_BUCKET}/batch_outputs")
 
+# 업로드 파일명 패턴(원하면 더 엄격하게): review_yyyymmdd.xlsx
+UPLOAD_XLSX_PATTERN = os.getenv("UPLOAD_XLSX_PATTERN", r"^review_\d{8}\.xlsx$")
+
+# -----------------------------
+# Model / Vertex Batch (global 강제)
+# -----------------------------
+# 기본 모델(원하면 env로 교체)
+VERTEX_GEMINI_MODEL = os.getenv("VERTEX_GEMINI_MODEL", "gemini-2.5-flash-lite")  # :contentReference[oaicite:2]{index=2}
+# 404 대비 fallback (가급적 “동작하는 모델” 우선)
+MODEL_FALLBACKS = [
+    os.getenv("VERTEX_GEMINI_MODEL", "gemini-2.5-flash-lite"),
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+]
+
+# Batch는 global endpoint 사용
+GENAI_LOCATION = "global"  # :contentReference[oaicite:3]{index=3}
+
+# -----------------------------
 # 엑셀 헤더(한글) -> 표준 컬럼명(BQ)
+# -----------------------------
 EXCEL_TO_STD = {
     "상품평작성일자": "write_date",
     "상품평리뷰번호": "review_no",
     "리뷰SEQ": "review_seq",
     "채널구분": "channel",
     "브랜드코드": "brand_no",
-    "스타일코드": "product_no",  # 내부에서 product_no로 쓰기로 했으면 OK
+    "스타일코드": "product_no",
     "대카테고리": "review_1depth",
     "소카테고리": "review_2depth",
     "리뷰별점": "review_score",
@@ -108,19 +134,17 @@ def _now_utc() -> datetime:
 
 
 # -----------------------------
-# (2) XLSX 검증 추가
+# (2) XLSX 검증
 # -----------------------------
 def _assert_xlsx(local_path: str, object_name: str):
     if not object_name.lower().endswith(".xlsx"):
         raise ValueError(f"Not an .xlsx file: {object_name}")
 
-    # xlsx는 zip 컨테이너이므로 zip signature "PK"로 빠르게 검사
     with open(local_path, "rb") as f:
         sig = f.read(2)
     if sig != b"PK":
         raise ValueError("Uploaded file is not a valid .xlsx (zip header 'PK' not found)")
 
-    # zip 자체가 정상인지도 확인(추가 안전)
     try:
         with zipfile.ZipFile(local_path, "r") as zf:
             _ = zf.namelist()[:1]
@@ -171,7 +195,6 @@ def _mark_ingestion(status: str, bucket: str, object_name: str, generation: str,
 
 
 def _raw_already_loaded(bucket: str, object_name: str, generation: str) -> bool:
-    """재시도 시 reviews_raw 중복 append 방지용"""
     client = _bq()
     sql = f"""
     SELECT 1
@@ -218,9 +241,6 @@ def _load_excel_mapped(path: str) -> pd.DataFrame:
 # BigQuery writes
 # -----------------------------
 def _append_reviews_raw(df_std: pd.DataFrame, bucket: str, name: str, generation: str):
-    """
-    reviews_raw는 STRING 위주(loaded_at만 TIMESTAMP)
-    """
     client = _bq()
     loaded_at = _now_utc()
     ingest_id = uuid.uuid4().hex
@@ -258,28 +278,22 @@ def _append_reviews_raw(df_std: pd.DataFrame, bucket: str, name: str, generation
     logger.info("BQ append reviews_raw rows=%d ingest_id=%s", len(df_raw), ingest_id)
 
 
-# -----------------------------
-# (1) reviews_clean MERGE를 '절대 안 터지게' 완전 교체
-# -----------------------------
 def _merge_reviews_clean(df_std: pd.DataFrame):
     """
-    핵심 안정화:
-    - review_seq 파싱 실패는 0으로 몰지 말고 drop (중복 review_key 폭발 방지)
-    - staging에 review_key 중복이 있어도 MERGE가 터지지 않게 SQL에서 ROW_NUMBER로 1개만 남김
+    안정화:
+    - review_seq 파싱 실패는 0으로 몰지 말고 drop
+    - staging 중복 review_key는 MERGE 소스에서 ROW_NUMBER로 1행만 남김
     """
     client = _bq()
     loaded_at = _now_utc()
 
     df = df_std.copy()
-
-    # 안전 파싱
     df["review_no"] = df["review_no"].astype(str).str.strip()
 
     df["review_seq_num"] = pd.to_numeric(df["review_seq"], errors="coerce")
     df["review_score_num"] = pd.to_numeric(df["review_score"], errors="coerce")
     df["write_date_dt"] = pd.to_datetime(df["write_date"], errors="coerce").dt.date
 
-    # 필수키 파싱 실패 행 제거 (매우 중요)
     before = len(df)
     df = df[df["review_no"].notna() & (df["review_no"] != "")]
     df = df[df["review_seq_num"].notna()]
@@ -298,7 +312,6 @@ def _merge_reviews_clean(df_std: pd.DataFrame):
 
     df["review_key"] = df["review_no"] + "-" + df["review_seq"].astype(str)
 
-    # MVP: 아직 DLP 마스킹 전이므로 원문을 그대로 masked로 채움
     df["review_text_masked"] = df["review_contents"].astype(str)
     df["normalized_text"] = df["review_contents"].astype(str)
 
@@ -323,7 +336,6 @@ def _merge_reviews_clean(df_std: pd.DataFrame):
         }
     )
 
-    # staging 테이블 로드
     staging_table = f"{PROJECT_ID}.{DATASET}.staging_reviews_clean_{uuid.uuid4().hex[:10]}"
     client.load_table_from_dataframe(
         df_stage,
@@ -331,7 +343,6 @@ def _merge_reviews_clean(df_std: pd.DataFrame):
         job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE"),
     ).result()
 
-    # ✅ 중요: MERGE 소스를 subquery로 감싸서 review_key당 1행만 남기기
     merge_sql = f"""
     MERGE `{TABLE_CLEAN}` T
     USING (
@@ -443,13 +454,16 @@ def _build_prompt(row: dict) -> str:
 """.strip()
 
 
-def make_batch_input_jsonl_and_upload(bucket: str, object_name: str, generation: str) -> str:
+def make_batch_input_jsonl_and_upload(source_bucket: str, object_name: str, generation: str) -> str:
+    """
+    ⚠️ JSONL은 반드시 ARCHIVE_BUCKET에 저장 (업로드 버킷에 저장하면 재귀 트리거 위험)
+    """
     bq = _bq()
     gcs = _gcs()
 
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
-            bigquery.ScalarQueryParameter("bucket", "STRING", bucket),
+            bigquery.ScalarQueryParameter("bucket", "STRING", source_bucket),
             bigquery.ScalarQueryParameter("object_name", "STRING", object_name),
             bigquery.ScalarQueryParameter("generation", "STRING", generation),
         ]
@@ -480,48 +494,74 @@ def make_batch_input_jsonl_and_upload(bucket: str, object_name: str, generation:
         logger.info("BATCH INPUT: no targets (already analyzed or empty)")
         return ""
 
-    dest_blob = f"{BATCH_INPUT_PREFIX}/{object_name}/{generation}/batch_input.jsonl"
-    gcs.bucket(BATCH_BUCKET).blob(dest_blob).upload_from_filename(
+    safe_name = object_name.replace("/", "_")
+    dest_blob = f"{BATCH_INPUT_PREFIX}/{safe_name}/{generation}/batch_input.jsonl"
+    gcs.bucket(ARCHIVE_BUCKET).blob(dest_blob).upload_from_filename(
         tmp_path, content_type="application/jsonl"
     )
 
-    input_uri = f"gs://{BATCH_BUCKET}/{dest_blob}"
+    input_uri = f"gs://{ARCHIVE_BUCKET}/{dest_blob}"
     logger.info("BATCH INPUT uploaded: %s (rows=%d)", input_uri, rows_written)
     return input_uri
 
 
 # -----------------------------
-# (3) Vertex AI Batch submit: global 강제 + output gs://.../batch_outputs/...
+# Vertex AI Batch submit (global 강제 + model fallback)
 # -----------------------------
+def _create_genai_client_global() -> genai.Client:
+    # 문서 예시처럼 env로 VertexAI 사용 + global 설정 :contentReference[oaicite:4]{index=4}
+    os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "True"
+    os.environ["GOOGLE_CLOUD_PROJECT"] = PROJECT_ID
+    os.environ["GOOGLE_CLOUD_LOCATION"] = GENAI_LOCATION
+    return genai.Client(http_options=HttpOptions(api_version="v1"))
+
+
 def submit_vertex_batch_job_global(input_jsonl_gcs_uri: str, object_name: str, generation: str) -> str:
     if not input_jsonl_gcs_uri:
         return ""
 
-    # 결과 prefix를 파일별로 분리(혼합 방지)
-    output_prefix = BATCH_OUTPUT_PREFIX.rstrip("/") + f"/{object_name}/{generation}/"
+    safe_name = object_name.replace("/", "_")
+    output_prefix = BATCH_OUTPUT_PREFIX.rstrip("/") + f"/{safe_name}/{generation}/"
 
-    # ✅ global 강제
-    os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "True"
-    os.environ["GOOGLE_CLOUD_PROJECT"] = PROJECT_ID
-    os.environ["GOOGLE_CLOUD_LOCATION"] = "global"
+    client = _create_genai_client_global()
 
-    # google-genai client
-    client = genai.Client(http_options=HttpOptions(api_version="v1"))
-    job = client.batches.create(
-        model=VERTEX_GEMINI_MODEL,
-        src=input_jsonl_gcs_uri,
-        config=CreateBatchJobConfig(dest=output_prefix),
-    )
+    last_err = None
+    tried = []
 
-    job_name = getattr(job, "name", "") or str(job)
-    logger.info(
-        "BATCH SUBMITTED location=global model=%s input=%s output=%s job=%s",
-        VERTEX_GEMINI_MODEL,
-        input_jsonl_gcs_uri,
-        output_prefix,
-        job_name,
-    )
-    return job_name
+    for model_id in MODEL_FALLBACKS:
+        if not model_id or model_id in tried:
+            continue
+        tried.append(model_id)
+
+        try:
+            job = client.batches.create(
+                model=model_id,
+                src=input_jsonl_gcs_uri,
+                config=CreateBatchJobConfig(dest=output_prefix),
+            )
+            job_name = getattr(job, "name", "") or str(job)
+            logger.info(
+                "BATCH SUBMITTED location=%s model=%s input=%s output=%s job=%s",
+                GENAI_LOCATION,
+                model_id,
+                input_jsonl_gcs_uri,
+                output_prefix,
+                job_name,
+            )
+            return job_name
+
+        except genai_errors.ClientError as e:
+            last_err = e
+            # 404면 다음 모델로 fallback
+            msg = str(e)
+            logger.warning("Batch create failed model=%s err=%s", model_id, msg)
+            if "404" in msg or "NOT_FOUND" in msg:
+                continue
+            # 404가 아닌 다른 에러면 즉시 raise(권한/쿼터/입력 포맷 등)
+            raise
+
+    # 모든 모델이 404면 여기로
+    raise RuntimeError(f"All batch models failed. tried={tried} last_err={last_err}")
 
 
 # -----------------------------
@@ -531,17 +571,38 @@ def submit_vertex_batch_job_global(input_jsonl_gcs_uri: str, object_name: str, g
 def ingest_from_gcs(cloud_event: CloudEvent):
     data = cloud_event.data or {}
 
-    bucket = data.get("bucket")
-    name = data.get("name")
+    bucket = data.get("bucket") or ""
+    name = data.get("name") or ""
     generation = str(data.get("generation", ""))
 
     logger.info("EVENT bucket=%s name=%s generation=%s", bucket, name, generation)
-    logger.info("EVENT type=%s source=%s id=%s", cloud_event.get("type"), cloud_event.get("source"), cloud_event.get("id"))
 
-    if not bucket or not name:
-        logger.warning("Missing bucket/name in event payload. data=%s", data)
+    # -----------------------------
+    # ✅ 0) 필터링 (재귀/잡파일 차단)
+    # -----------------------------
+    # 업로드 버킷만 처리
+    if bucket != UPLOAD_BUCKET:
+        logger.info("SKIP: bucket not upload bucket. bucket=%s expected=%s", bucket, UPLOAD_BUCKET)
         return ("OK", 200)
 
+    # xlsx만 처리
+    if not name.lower().endswith(".xlsx"):
+        logger.info("SKIP: non-xlsx object: %s", name)
+        return ("OK", 200)
+
+    # 업로드 파일명 패턴(원하면 완화/비활성화 가능)
+    if UPLOAD_XLSX_PATTERN and not re.match(UPLOAD_XLSX_PATTERN, name):
+        logger.info("SKIP: filename not match pattern. name=%s pattern=%s", name, UPLOAD_XLSX_PATTERN)
+        return ("OK", 200)
+
+    # 혹시 업로드 버킷에 내부 prefix가 들어오면 차단
+    if name.startswith("batch_inputs/") or name.startswith("batch_outputs/"):
+        logger.info("SKIP: internal artifact in upload bucket: %s", name)
+        return ("OK", 200)
+
+    # -----------------------------
+    # ✅ 1) 멱등성 체크
+    # -----------------------------
     if _already_done(bucket, name, generation):
         logger.info("SKIP already DONE: %s/%s gen=%s", bucket, name, generation)
         return ("OK", 200)
@@ -549,31 +610,30 @@ def ingest_from_gcs(cloud_event: CloudEvent):
     _mark_ingestion("STARTED", bucket, name, generation)
 
     try:
-        # 1) 다운로드
+        # 2) 다운로드
         local_path = _download_xlsx(bucket, name)
 
-        # 2) (2) xlsx 검증 추가
+        # 3) xlsx 검증
         _assert_xlsx(local_path, name)
 
-        # 3) 로드 & 매핑
+        # 4) 로드 & 매핑
         df_std = _load_excel_mapped(local_path)
 
-        # 4) raw 적재 (재시도 중복 방지)
+        # 5) raw 적재 (재시도 중복 방지)
         if not _raw_already_loaded(bucket, name, generation):
             _append_reviews_raw(df_std, bucket, name, generation)
         else:
             logger.info("SKIP reviews_raw already loaded for %s/%s gen=%s", bucket, name, generation)
 
-        # 5) clean merge (중복/파싱 오류 방지 버전)
+        # 6) clean merge
         _merge_reviews_clean(df_std)
 
-        # 6) batch input 생성 + 업로드
+        # 7) batch input 생성 + 업로드(ARCHIVE_BUCKET!)
         input_uri = make_batch_input_jsonl_and_upload(bucket, name, generation)
 
-        # 7) batch job 제출 (global 강제)
+        # 8) batch job 제출(global 강제 + fallback)
         job_name = submit_vertex_batch_job_global(input_uri, name, generation)
 
-        # 8) DONE 마킹 (job_name 남김)
         _mark_ingestion(
             "DONE",
             bucket,
