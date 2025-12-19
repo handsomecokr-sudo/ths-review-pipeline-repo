@@ -726,27 +726,42 @@ def submit_vertex_batch_job_global(input_jsonl_gcs_uri: str, object_name: str, g
 # =========================================================
 def _ensure_llm_staging_table():
     client = _bq()
+
+    # 1) 테이블이 없으면 생성
     create_sql = f"""
     CREATE TABLE IF NOT EXISTS `{STG_LLM}` (
-      review_key STRING,
-      extracted_at STRING,
-      model_name STRING,
-      model_version STRING,
-      brand_no STRING,
-      product_no STRING,
-      issue_category STRING,
-      severity STRING,
-      sentiment STRING,
-      size_feedback STRING,
-      defect_part STRING,
-      color_mentioned STRING,
-      repurchase_intent STRING,
-      evidence STRING,
-      raw_json_str STRING,
-      prompt_version STRING
+      review_key STRING
     )
     """
     client.query(create_sql).result()
+
+    # 2) 컬럼이 빠져있을 수 있으니, 없으면 추가(스키마 보정)
+    #    (IF NOT EXISTS 지원)
+    alter_columns = [
+        ("extracted_at", "STRING"),
+        ("model_name", "STRING"),
+        ("model_version", "STRING"),
+        ("brand_no", "STRING"),
+        ("product_no", "STRING"),
+        ("issue_category", "STRING"),
+        ("severity", "STRING"),
+        ("sentiment", "STRING"),
+        ("size_feedback", "STRING"),
+        ("defect_part", "STRING"),
+        ("color_mentioned", "STRING"),
+        ("repurchase_intent", "STRING"),
+        ("evidence", "STRING"),
+        ("raw_json_str", "STRING"),     # ✅ 이번에 문제난 컬럼
+        ("prompt_version", "STRING"),
+    ]
+
+    for col, typ in alter_columns:
+        try:
+            client.query(f"ALTER TABLE `{STG_LLM}` ADD COLUMN IF NOT EXISTS {col} {typ}").result()
+        except Exception as e:
+            # 리전/계정에 따라 IF NOT EXISTS 미지원/권한 이슈 등 예외 대비
+            logger.warning("ALTER failed col=%s typ=%s err=%s", col, typ, str(e)[:300])
+
 
 
 def _parse_predictions_jsonl_to_rows(local_path: str) -> List[Dict[str, Any]]:
