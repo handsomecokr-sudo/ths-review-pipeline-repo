@@ -2,15 +2,18 @@
 import json
 import logging
 import os
+import random
+import time
 import uuid
 import zipfile
-from datetime import datetime, date, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import functions_framework
 import google.auth
 import pandas as pd
 from cloudevents.http import CloudEvent
+from google.api_core.exceptions import TooManyRequests
 from google.cloud import bigquery
 from google.cloud import storage
 
@@ -77,7 +80,8 @@ TABLE_PROD_TOTAL = f"{PROJECT_ID}.{DATASET}.product_total_feedback_summary_llm"
 
 # Fixed staging tables
 STG_CLEAN = f"{PROJECT_ID}.{DATASET}.staging_reviews_clean"
-STG_LLM = f"{PROJECT_ID}.{DATASET}.staging_review_llm_extract"
+# NOTE: review-level STG_LLM은 더 이상 "고정 1개"로 쓰지 않고, run마다 임시 테이블로 전환합니다.
+# STG_LLM = f"{PROJECT_ID}.{DATASET}.staging_review_llm_extract"
 
 # Excel header mapping (Korean -> Std)
 EXCEL_TO_STD = {
@@ -357,6 +361,10 @@ def _ensure_ingestion_table():
 
 
 def _load_ndjson_to_table(table_id: str, local_ndjson_path: str, write_disposition: str):
+    """
+    NDJSON(local) -> BQ Load job
+    + (선택) 429(TooManyRequests) 중에서도 table.write rateLimitExceeded일 때만 아주 얇게 재시도.
+    """
     client = _bq()
     job_config = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
@@ -364,16 +372,53 @@ def _load_ndjson_to_table(table_id: str, local_ndjson_path: str, write_dispositi
         ignore_unknown_values=True,
         max_bad_records=0,
     )
+
     with open(local_ndjson_path, "rb") as f:
         job = client.load_table_from_file(f, table_id, job_config=job_config)
 
-    try:
-        job.result()
-    except Exception:
-        logger.error("BQ LOAD FAILED table=%s file=%s", table_id, local_ndjson_path)
-        logger.error("BQ job_id=%s state=%s error_result=%s", job.job_id, job.state, job.error_result)
-        logger.error("BQ errors=%s", job.errors)
-        raise
+    max_attempts = 6  # small retries
+    for attempt in range(max_attempts):
+        try:
+            job.result()
+            return
+        except TooManyRequests:
+            reason = None
+            location = None
+            try:
+                if getattr(job, "error_result", None):
+                    reason = job.error_result.get("reason")
+                    location = job.error_result.get("location")
+            except Exception:
+                reason = None
+                location = None
+
+            is_table_write_ratelimit = (reason == "rateLimitExceeded" and location == "table.write")
+            if not is_table_write_ratelimit:
+                logger.error("BQ LOAD FAILED(non-retriable 429) table=%s file=%s", table_id, local_ndjson_path)
+                logger.error("BQ job_id=%s state=%s error_result=%s", job.job_id, job.state, job.error_result)
+                logger.error("BQ errors=%s", job.errors)
+                raise
+
+            sleep = min((2**attempt) + random.random(), 30.0)
+            logger.warning(
+                "BQ LOAD 429 rateLimitExceeded(table.write). retry attempt=%d/%d sleep=%.2fs table=%s file=%s job_id=%s",
+                attempt + 1,
+                max_attempts,
+                sleep,
+                table_id,
+                local_ndjson_path,
+                job.job_id,
+            )
+            time.sleep(sleep)
+            continue
+        except Exception:
+            logger.error("BQ LOAD FAILED table=%s file=%s", table_id, local_ndjson_path)
+            logger.error("BQ job_id=%s state=%s error_result=%s", job.job_id, job.state, job.error_result)
+            logger.error("BQ errors=%s", job.errors)
+            raise
+
+    # retries exhausted
+    job.result()
 
 
 def _already_done(bucket: str, object_name: str, generation: str) -> bool:
@@ -659,10 +704,13 @@ def _append_reviews_raw_ndjson(df_std: pd.DataFrame, bucket: str, name: str, gen
     loaded_at = _now_utc().isoformat()
     base_ingest_id = uuid.uuid4().hex
 
-    rows: List[Dict[str, Any]] = []
-    for idx, r in df_std.iterrows():
-        rows.append(
-            {
+    tmp = f"/tmp/raw_{uuid.uuid4().hex}.ndjson"
+    rows_written = 0
+
+    # (작은 개선) 메모리 절약: rows 리스트를 만들지 않고 스트리밍으로 NDJSON 작성
+    with open(tmp, "w", encoding="utf-8") as f:
+        for idx, r in df_std.iterrows():
+            row = {
                 "ingest_id": f"{base_ingest_id}-{idx}",
                 "source_bucket": bucket,
                 "source_object": name,
@@ -681,15 +729,11 @@ def _append_reviews_raw_ndjson(df_std: pd.DataFrame, bucket: str, name: str, gen
                 "review_ai_score": str(r.get("review_ai_score", "")),
                 "review_ai_contents": str(r.get("review_ai_contents", "")),
             }
-        )
-
-    tmp = f"/tmp/raw_{uuid.uuid4().hex}.ndjson"
-    with open(tmp, "w", encoding="utf-8") as f:
-        for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            rows_written += 1
 
     _load_ndjson_to_table(TABLE_RAW, tmp, write_disposition="WRITE_APPEND")
-    logger.info("BQ append reviews_raw rows=%d ingest_id=%s", len(rows), base_ingest_id)
+    logger.info("BQ append reviews_raw rows=%d ingest_id=%s", rows_written, base_ingest_id)
 
 
 # -----------------------------
@@ -748,10 +792,11 @@ def _merge_reviews_clean_fixed_staging(df_std: pd.DataFrame):
     df["review_text_masked"] = df["review_contents"].astype(str)
     df["normalized_text"] = df["review_contents"].astype(str)
 
-    rows: List[Dict[str, Any]] = []
-    for _, r in df.iterrows():
-        rows.append(
-            {
+    tmp = f"/tmp/stg_clean_{uuid.uuid4().hex}.ndjson"
+    rows_written = 0
+    with open(tmp, "w", encoding="utf-8") as f:
+        for _, r in df.iterrows():
+            row = {
                 "review_key": str(r.get("review_key", "")),
                 "review_no": str(r.get("review_no", "")),
                 "review_seq": str(r.get("review_seq", "")),
@@ -769,12 +814,8 @@ def _merge_reviews_clean_fixed_staging(df_std: pd.DataFrame):
                 "legacy_review_ai_contents": str(r.get("review_ai_contents", "")),
                 "loaded_at": loaded_at,
             }
-        )
-
-    tmp = f"/tmp/stg_clean_{uuid.uuid4().hex}.ndjson"
-    with open(tmp, "w", encoding="utf-8") as f:
-        for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            rows_written += 1
 
     _load_ndjson_to_table(STG_CLEAN, tmp, write_disposition="WRITE_TRUNCATE")
 
@@ -844,7 +885,7 @@ def _merge_reviews_clean_fixed_staging(df_std: pd.DataFrame):
       )
     """
     client.query(merge_sql).result()
-    logger.info("BQ MERGE reviews_clean done rows=%d (seq=STRING)", len(rows))
+    logger.info("BQ MERGE reviews_clean done rows=%d (seq=STRING)", rows_written)
 
 
 # -----------------------------
@@ -1088,54 +1129,56 @@ def _submit_vertex_batch_job_global_custom(input_jsonl_gcs_uri: str, output_pref
 
 
 # =========================================================
-# ARCHIVE ROUTE (review-level): predictions.jsonl -> BQ 적재 + metrics 갱신
+# REVIEW-LEVEL (ARCHIVE): 임시 stg 테이블 + 스트리밍 파서/NDJSON writer
 # =========================================================
-def _ensure_llm_staging_table():
+def _create_review_llm_temp_stg_table(stg_table: str):
+    """
+    review-level staging table을 "run마다 임시 테이블"로 생성.
+    - 고정 STG + ALTER 반복을 제거해서 table metadata update 폭탄을 줄임
+    """
     client = _bq()
-
     client.query(
         f"""
-    CREATE TABLE IF NOT EXISTS `{STG_LLM}` (
-      review_key STRING
+    CREATE TABLE `{stg_table}` (
+      review_key STRING,
+      extracted_at STRING,
+      model_name STRING,
+      model_version STRING,
+      brand_no STRING,
+      product_no STRING,
+      issue_category STRING,
+      severity STRING,
+      sentiment STRING,
+      size_feedback STRING,
+      defect_part STRING,
+      color_mentioned STRING,
+      repurchase_intent STRING,
+      evidence STRING,
+      raw_json_str STRING,
+      prompt_version STRING
     )
     """
     ).result()
 
-    alter_columns = [
-        ("extracted_at", "STRING"),
-        ("model_name", "STRING"),
-        ("model_version", "STRING"),
-        ("brand_no", "STRING"),
-        ("product_no", "STRING"),
-        ("issue_category", "STRING"),
-        ("severity", "STRING"),
-        ("sentiment", "STRING"),
-        ("size_feedback", "STRING"),
-        ("defect_part", "STRING"),
-        ("color_mentioned", "STRING"),
-        ("repurchase_intent", "STRING"),
-        ("evidence", "STRING"),
-        ("raw_json_str", "STRING"),
-        ("prompt_version", "STRING"),
-    ]
 
-    for col, typ in alter_columns:
-        try:
-            client.query(f"ALTER TABLE `{STG_LLM}` ADD COLUMN IF NOT EXISTS {col} {typ}").result()
-        except Exception as e:
-            logger.warning("ALTER failed col=%s typ=%s err=%s", col, typ, str(e)[:300])
-
-
-def _parse_predictions_jsonl_to_rows(local_path: str) -> List[Dict[str, Any]]:
+def _stream_review_predictions_to_stg_ndjson(local_predictions_path: str, out_ndjson_path: str) -> Tuple[int, List[str]]:
     """
-    Vertex Batch predictions.jsonl:
-    - 각 줄: {"request":..., "response": {...}} 형태
-    - 모델 출력은 보통 response.candidates[0].content.parts[0].text 안에 JSON(단일/배열)
+    Vertex Batch predictions.jsonl을 스트리밍으로 읽어서,
+    BQ staging table schema에 맞춘 NDJSON을 스트리밍으로 생성.
+    반환: (rows_written, distinct_review_keys_list)
     """
-    rows: List[Dict[str, Any]] = []
+    model_name = _normalize_model_name(VERTEX_GEMINI_MODEL)
+    review_keys_set = set()
+    rows_written = 0
 
-    with open(local_path, "r", encoding="utf-8") as f:
-        for line in f:
+    def _to_str_or_none(v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s if s != "" else None
+
+    with open(local_predictions_path, "r", encoding="utf-8") as fin, open(out_ndjson_path, "w", encoding="utf-8") as fout:
+        for line in fin:
             line = line.strip()
             if not line:
                 continue
@@ -1149,7 +1192,6 @@ def _parse_predictions_jsonl_to_rows(local_path: str) -> List[Dict[str, Any]]:
 
             resp = obj.get("response") or {}
             model_version = str(resp.get("modelVersion") or resp.get("model_version") or "")
-            model_name = _normalize_model_name(VERTEX_GEMINI_MODEL)
 
             text = ""
             try:
@@ -1179,12 +1221,6 @@ def _parse_predictions_jsonl_to_rows(local_path: str) -> List[Dict[str, Any]]:
                 if not isinstance(signals, dict):
                     signals = {}
 
-                def _to_str_or_none(v: Any) -> Optional[str]:
-                    if v is None:
-                        return None
-                    s = str(v).strip()
-                    return s if s != "" else None
-
                 row = {
                     "review_key": review_key,
                     "extracted_at": extracted_at,
@@ -1203,15 +1239,16 @@ def _parse_predictions_jsonl_to_rows(local_path: str) -> List[Dict[str, Any]]:
                     "raw_json_str": json.dumps(item, ensure_ascii=False),
                     "prompt_version": PROMPT_VERSION,
                 }
-                rows.append(row)
+                fout.write(json.dumps(row, ensure_ascii=False) + "\n")
+                rows_written += 1
+                review_keys_set.add(review_key)
 
-    return rows
+    return rows_written, sorted(review_keys_set)
 
 
-def _merge_review_llm_extract_from_staging():
+def _merge_review_llm_extract_from_staging(stg_table: str):
     """
-    STG_LLM(STRING) -> review_llm_extract(JSON 포함)로 MERGE
-    - raw_json은 SAFE.PARSE_JSON(raw_json_str)
+    (시그니처 변경) stg_table -> review_llm_extract 로 MERGE
     """
     client = _bq()
 
@@ -1223,7 +1260,7 @@ def _merge_review_llm_extract_from_staging():
         SELECT
           S.*,
           ROW_NUMBER() OVER (PARTITION BY review_key ORDER BY CAST(extracted_at AS STRING) DESC) AS rn
-        FROM `{STG_LLM}` S
+        FROM `{stg_table}` S
         WHERE review_key IS NOT NULL AND review_key != ''
       )
       WHERE rn = 1
@@ -1274,12 +1311,11 @@ def _merge_review_llm_extract_from_staging():
     client.query(merge_sql).result()
 
 
-def _merge_style_daily_metrics_for_staged_keys():
+def _merge_style_daily_metrics_for_staged_keys(stg_table: str):
     """
-    style_daily_metrics 갱신:
-    - 대상: 이번 STG_LLM에 들어온 review_key들
+    (시그니처 변경) style_daily_metrics 갱신:
+    - 대상: 이번 stg_table에 들어온 review_key들
     - 집계: (write_date, brand_no, product_no, channel, issue_category)
-      review_cnt / neg_cnt / severe_cnt / avg_rating
     """
     client = _bq()
 
@@ -1288,7 +1324,7 @@ def _merge_style_daily_metrics_for_staged_keys():
     USING (
       WITH keys AS (
         SELECT DISTINCT review_key
-        FROM `{STG_LLM}`
+        FROM `{stg_table}`
         WHERE review_key IS NOT NULL AND review_key != ''
       ),
       joined AS (
@@ -1343,6 +1379,7 @@ def _merge_style_daily_metrics_for_staged_keys():
 
 # =========================================================
 # PRODUCT-LEVEL: prompts + build inputs + parse + merge
+# (아래부터는 기존 코드 유지)
 # =========================================================
 def _build_product_daily_prompt(
     batch_run_key: str,
@@ -1973,6 +2010,7 @@ def handle_archive_event(bucket: str, name: str, generation: str) -> Tuple[str, 
     """
     ARCHIVE_BUCKET 이벤트 처리 (확장):
     1) 리뷰 단위: batch_outputs/**/predictions*.jsonl -> review_llm_extract + metrics -> product_daily batch 제출
+       (개선) review-level STG를 "임시 테이블"로, 파서/NDJSON writer는 스트리밍으로
     2) 상품 일자 단위: batch_outputs_product_daily/**/predictions*.jsonl -> product_daily_feedback_llm
        -> style_daily_metrics에 라벨 자동 MERGE -> product_total batch 제출
     3) 상품 누적 단위: batch_outputs_product_total/**/predictions*.jsonl -> product_total_feedback_summary_llm
@@ -2107,41 +2145,48 @@ def handle_archive_event(bucket: str, name: str, generation: str) -> Tuple[str, 
         logger.info("ARCHIVE processed product_daily rows=%d file=%s", len(rows), name)
         return ("DONE", f"PROD_DAILY_ROWS={len(rows)} TOTAL_JOB=SKIP_NO_TARGETS")
 
-    # ---- review-level outputs
+    # ---- review-level outputs (개선 적용 구간)
     if not n.startswith(BATCH_OUTPUT_PREFIX + "/"):
         return ("SKIP", f"archive route: not under known output prefixes name={name}")
 
-    local = _download_from_gcs(bucket, name, suffix=".jsonl")
-    _ensure_llm_staging_table()
-
-    rows = _parse_predictions_jsonl_to_rows(local)
-    if not rows:
-        return ("DONE", "NO_RECORDS")
-
-    tmp = f"/tmp/stg_llm_{uuid.uuid4().hex}.ndjson"
-    with open(tmp, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-    _load_ndjson_to_table(STG_LLM, tmp, write_disposition="WRITE_TRUNCATE")
-
-    _merge_review_llm_extract_from_staging()
-    _merge_style_daily_metrics_for_staged_keys()
-
-    # NEW: product_daily batch 제출 (이번 invocation의 review_keys 기반)
-    review_keys = [r.get("review_key") for r in rows if r.get("review_key")]
-
     obj_name, obj_gen = _extract_object_and_generation_from_archive_path(n, BATCH_OUTPUT_PREFIX)
-    if obj_name and obj_gen:
+    if not obj_name or not obj_gen:
+        return ("SKIP", f"review-level route: cannot parse object/gen name={name}")
+
+    local = _download_from_gcs(bucket, name, suffix=".jsonl")
+
+    client = _bq()
+    stg_table = f"{PROJECT_ID}.{DATASET}.stg_llm_{uuid.uuid4().hex}"
+    _create_review_llm_temp_stg_table(stg_table)
+
+    try:
+        tmp = f"/tmp/stg_llm_{uuid.uuid4().hex}.ndjson"
+        rows_written, review_keys = _stream_review_predictions_to_stg_ndjson(local, tmp)
+        if rows_written == 0:
+            client.query(f"DROP TABLE `{stg_table}`").result()
+            return ("DONE", "NO_RECORDS")
+
+        _load_ndjson_to_table(stg_table, tmp, write_disposition="WRITE_TRUNCATE")
+
+        _merge_review_llm_extract_from_staging(stg_table)
+        _merge_style_daily_metrics_for_staged_keys(stg_table)
+
+        # NEW: product_daily batch 제출 (이번 invocation에서 처리한 review_keys 기반)
         input_uri = make_product_daily_batch_input_jsonl_and_upload(object_name=obj_name, generation=obj_gen, review_keys=review_keys)
         if input_uri:
             out_prefix = f"gs://{ARCHIVE_BUCKET}/{BATCH_OUTPUT_PREFIX_PROD_DAILY}/{obj_name}/{obj_gen}/"
             job = _submit_vertex_batch_job_global_custom(input_uri, output_prefix=out_prefix)
-            logger.info("ARCHIVE processed review-level rows=%d file=%s", len(rows), name)
-            return ("DONE", f"LLM_ROWS={len(rows)} PROD_DAILY_JOB={job}")
+            logger.info("ARCHIVE processed review-level rows=%d file=%s", rows_written, name)
+            return ("DONE", f"LLM_ROWS={rows_written} PROD_DAILY_JOB={job}")
 
-    logger.info("ARCHIVE processed review-level rows=%d file=%s", len(rows), name)
-    return ("DONE", f"LLM_ROWS={len(rows)} PROD_DAILY_JOB=SKIP_PATH_PARSE_FAIL")
+        logger.info("ARCHIVE processed review-level rows=%d file=%s", rows_written, name)
+        return ("DONE", f"LLM_ROWS={rows_written} PROD_DAILY_JOB=SKIP_NO_TARGETS")
+    finally:
+        # 임시 stg 테이블 정리
+        try:
+            client.query(f"DROP TABLE `{stg_table}`").result()
+        except Exception as e:
+            logger.warning("Failed to DROP temp stg table (non-fatal) table=%s err=%s", stg_table, str(e)[:300])
 
 
 # =========================================================
