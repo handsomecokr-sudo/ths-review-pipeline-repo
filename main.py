@@ -6,7 +6,7 @@ import random
 import time
 import uuid
 import zipfile
-from datetime import date, datetime, timezone
+from datetime import datetime, date, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import functions_framework
@@ -67,6 +67,35 @@ MAX_REVIEWS_PER_PRODUCT_DAY = int(os.getenv("MAX_REVIEWS_PER_PRODUCT_DAY") or "2
 MAX_REVIEW_TEXT_CHARS_PRODUCT = int(os.getenv("MAX_REVIEW_TEXT_CHARS_PRODUCT") or "500")
 TOTAL_SUMMARY_LOOKBACK_DAYS = int(os.getenv("TOTAL_SUMMARY_LOOKBACK_DAYS") or "30")
 
+# -----------------------------
+# Exclusions (analysis skip)
+# - E0 브랜드 전체 제외
+# - 특정 상품코드 E02A5ZZZ999M 제외
+# -----------------------------
+EXCLUDED_BRAND_NOS = set(
+    [s.strip() for s in (os.getenv("EXCLUDED_BRAND_NOS") or "E0").split(",") if s.strip()]
+)
+EXCLUDED_PRODUCT_NOS = set(
+    [s.strip() for s in (os.getenv("EXCLUDED_PRODUCT_NOS") or "E02A5ZZZ999M").split(",") if s.strip()]
+)
+
+def _is_excluded_brand_product(brand_no: Any, product_no: Any) -> bool:
+    b = str(brand_no or "").strip()
+    p = str(product_no or "").strip()
+    return (b in EXCLUDED_BRAND_NOS) or (p in EXCLUDED_PRODUCT_NOS)
+
+def _sql_not_in_clause(field_expr: str, values: set) -> str:
+    """
+    values가 비어있으면 항상 TRUE가 되도록 반환.
+    BigQuery 표준SQL에서 사용할 수 있는 boolean expression을 만든다.
+    """
+    if not values:
+        return "TRUE"
+    # 단순 안전 처리: ' -> \'
+    vals = ", ".join([("'" + str(v).replace("'", "\\'") + "'") for v in sorted(values)])
+    return f"IFNULL({field_expr}, '') NOT IN ({vals})"
+
+
 # Tables
 TABLE_INGEST = f"{PROJECT_ID}.{DATASET}.ingestion_files"
 TABLE_RAW = f"{PROJECT_ID}.{DATASET}.reviews_raw"
@@ -81,7 +110,6 @@ TABLE_PROD_TOTAL = f"{PROJECT_ID}.{DATASET}.product_total_feedback_summary_llm"
 # Fixed staging tables
 STG_CLEAN = f"{PROJECT_ID}.{DATASET}.staging_reviews_clean"
 # NOTE: review-level STG_LLM은 더 이상 "고정 1개"로 쓰지 않고, run마다 임시 테이블로 전환합니다.
-# STG_LLM = f"{PROJECT_ID}.{DATASET}.staging_review_llm_extract"
 
 # Excel header mapping (Korean -> Std)
 EXCEL_TO_STD = {
@@ -120,14 +148,11 @@ EXPECTED_STD_COLS = [
 def _bq() -> bigquery.Client:
     return bigquery.Client(project=PROJECT_ID)
 
-
 def _gcs() -> storage.Client:
     return storage.Client(project=PROJECT_ID)
 
-
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
-
 
 # -----------------------------
 # Utils
@@ -166,7 +191,6 @@ def _normalize_write_date_to_ymd(v: Any) -> str:
     except Exception:
         return ""
 
-
 def _is_internal_object(name: str) -> bool:
     n = (name or "").lstrip("/")
     return (
@@ -180,13 +204,11 @@ def _is_internal_object(name: str) -> bool:
         or n.lower().endswith(".ndjson")
     )
 
-
 def _basename(path: str) -> str:
     p = (path or "").rstrip("/")
     if "/" not in p:
         return p
     return p.split("/")[-1]
-
 
 def _safe_json_extract(text: str) -> Optional[Any]:
     """
@@ -229,7 +251,6 @@ def _safe_json_extract(text: str) -> Optional[Any]:
     except Exception:
         return None
 
-
 def _parse_extracted_at_from_line(line_obj: dict) -> str:
     """
     batch output 라인에 processed_time 같은 값이 있으면 사용하고,
@@ -248,7 +269,6 @@ def _parse_extracted_at_from_line(line_obj: dict) -> str:
             except Exception:
                 continue
     return _now_utc().isoformat()
-
 
 def _extract_object_and_generation_from_archive_path(path: str, output_prefix: str) -> Tuple[str, str]:
     """
@@ -279,10 +299,8 @@ def _extract_object_and_generation_from_archive_path(path: str, output_prefix: s
     generation = parts[gen_idx]
     return (object_name, generation)
 
-
 def _batch_run_key(object_name: str, generation: str) -> str:
     return f"{object_name}::{generation}"
-
 
 def _is_low_quality_review_text(text: str) -> bool:
     s = (text or "").strip()
@@ -295,13 +313,11 @@ def _is_low_quality_review_text(text: str) -> bool:
         return True
     return False
 
-
 def _truncate_text(s: str, max_chars: int) -> str:
     s = (s or "").strip()
     if len(s) <= max_chars:
         return s
     return s[:max_chars] + "…"
-
 
 # -----------------------------
 # XLSX Validation / Download
@@ -311,7 +327,6 @@ def _download_from_gcs(bucket: str, name: str, suffix: str = "") -> str:
     client = _gcs()
     client.bucket(bucket).blob(name).download_to_filename(local_path)
     return local_path
-
 
 def _assert_xlsx(local_path: str, object_name: str):
     if not object_name.lower().endswith(".xlsx"):
@@ -328,7 +343,6 @@ def _assert_xlsx(local_path: str, object_name: str):
     except zipfile.BadZipFile:
         raise ValueError("Uploaded file is not a valid .xlsx (bad zip archive)")
 
-
 def _load_excel_mapped(path: str) -> pd.DataFrame:
     df = pd.read_excel(path, engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
@@ -339,7 +353,6 @@ def _load_excel_mapped(path: str) -> pd.DataFrame:
         raise ValueError(f"컬럼 매핑 후 누락: {missing}. 현재 컬럼={list(df.columns)}")
 
     return df[EXPECTED_STD_COLS].copy()
-
 
 # -----------------------------
 # BigQuery helpers
@@ -358,7 +371,6 @@ def _ensure_ingestion_table():
     )
     """
     ).result()
-
 
 def _load_ndjson_to_table(table_id: str, local_ndjson_path: str, write_disposition: str):
     """
@@ -417,9 +429,7 @@ def _load_ndjson_to_table(table_id: str, local_ndjson_path: str, write_dispositi
             logger.error("BQ errors=%s", job.errors)
             raise
 
-    # retries exhausted
     job.result()
-
 
 def _already_done(bucket: str, object_name: str, generation: str) -> bool:
     client = _bq()
@@ -439,7 +449,6 @@ def _already_done(bucket: str, object_name: str, generation: str) -> bool:
     )
     rows = list(client.query(sql, job_config=job_config).result())
     return bool(rows) and rows[0]["status"] == "DONE"
-
 
 def _mark_ingestion(
     status: str,
@@ -465,7 +474,6 @@ def _mark_ingestion(
     )
     client.query(sql, job_config=job_config).result()
 
-
 def _raw_already_loaded(bucket: str, object_name: str, generation: str) -> bool:
     client = _bq()
     sql = f"""
@@ -483,7 +491,6 @@ def _raw_already_loaded(bucket: str, object_name: str, generation: str) -> bool:
     )
     rows = list(client.query(sql, job_config=job_config).result())
     return bool(rows)
-
 
 def _ensure_product_tables():
     """
@@ -552,7 +559,6 @@ def _ensure_product_tables():
     """
     ).result()
 
-
 def _ensure_style_metrics_product_label_columns():
     """
     style_daily_metrics에 상품 총평 라벨 컬럼이 없으면 추가한다.
@@ -593,7 +599,6 @@ def _ensure_style_metrics_product_label_columns():
         logger.info("style_daily_metrics columns added: %s", [c for c, _ in missing])
     except Exception as e:
         logger.warning("Failed to ALTER style_daily_metrics (non-fatal). err=%s", str(e)[:500])
-
 
 def _merge_style_daily_metrics_with_product_daily_labels_from_stg(stg_prod_daily_table: str):
     """
@@ -696,7 +701,6 @@ def _merge_style_daily_metrics_with_product_daily_labels_from_stg(stg_prod_daily
     except Exception as e:
         logger.warning("Failed to MERGE product labels into style_daily_metrics (non-fatal). err=%s", str(e)[:500])
 
-
 # -----------------------------
 # reviews_raw append (NDJSON load)
 # -----------------------------
@@ -707,7 +711,6 @@ def _append_reviews_raw_ndjson(df_std: pd.DataFrame, bucket: str, name: str, gen
     tmp = f"/tmp/raw_{uuid.uuid4().hex}.ndjson"
     rows_written = 0
 
-    # (작은 개선) 메모리 절약: rows 리스트를 만들지 않고 스트리밍으로 NDJSON 작성
     with open(tmp, "w", encoding="utf-8") as f:
         for idx, r in df_std.iterrows():
             row = {
@@ -735,9 +738,8 @@ def _append_reviews_raw_ndjson(df_std: pd.DataFrame, bucket: str, name: str, gen
     _load_ndjson_to_table(TABLE_RAW, tmp, write_disposition="WRITE_APPEND")
     logger.info("BQ append reviews_raw rows=%d ingest_id=%s", rows_written, base_ingest_id)
 
-
 # -----------------------------
-# reviews_clean MERGE (review_seq STRING)
+# reviews_clean MERGE (review_seq STRING) + Exclusion 적용
 # -----------------------------
 def _merge_reviews_clean_fixed_staging(df_std: pd.DataFrame):
     """
@@ -745,6 +747,7 @@ def _merge_reviews_clean_fixed_staging(df_std: pd.DataFrame):
     - staging은 STRING 적재
     - write_date=YYYYMMDD도 YYYY-MM-DD로 정규화
     - MERGE source 중복 review_key는 ROW_NUMBER로 1개만 남김
+    - ✅ EXCLUDED_BRAND_NOS / EXCLUDED_PRODUCT_NOS 는 clean부터 제외 (분석 파이프라인 전체 제외)
     """
     client = _bq()
     loaded_at = _now_utc().isoformat()
@@ -774,7 +777,22 @@ def _merge_reviews_clean_fixed_staging(df_std: pd.DataFrame):
     df = df_std.copy()
     df["review_no"] = df["review_no"].astype(str).str.strip()
     df["review_seq"] = df["review_seq"].astype(str).str.strip()
+    df["brand_no_str"] = df["brand_no"].astype(str).str.strip()
+    df["product_no_str"] = df["product_no"].astype(str).str.strip()
     df["write_date_str"] = df["write_date"].apply(_normalize_write_date_to_ymd)
+
+    # ✅ Exclusion filter (clean & downstream)
+    before_excl = len(df)
+    mask_keep = (~df["brand_no_str"].isin(EXCLUDED_BRAND_NOS)) & (~df["product_no_str"].isin(EXCLUDED_PRODUCT_NOS))
+    df = df[mask_keep].copy()
+    dropped_excl = before_excl - len(df)
+    if dropped_excl > 0:
+        logger.warning(
+            "EXCLUDE rows from reviews_clean (brand/product excluded) count=%d excluded_brands=%s excluded_products=%s",
+            dropped_excl,
+            sorted(list(EXCLUDED_BRAND_NOS))[:50],
+            sorted(list(EXCLUDED_PRODUCT_NOS))[:50],
+        )
 
     before = len(df)
     df = df[df["review_no"].notna() & (df["review_no"] != "")]
@@ -801,8 +819,8 @@ def _merge_reviews_clean_fixed_staging(df_std: pd.DataFrame):
                 "review_no": str(r.get("review_no", "")),
                 "review_seq": str(r.get("review_seq", "")),
                 "channel": str(r.get("channel", "")),
-                "brand_no": str(r.get("brand_no", "")),
-                "product_no": str(r.get("product_no", "")),
+                "brand_no": str(r.get("brand_no_str", "")),
+                "product_no": str(r.get("product_no_str", "")),
                 "write_date": str(r.get("write_date_str", "")),
                 "review_score": str(r.get("review_score", "")),
                 "review_1depth": str(r.get("review_1depth", "")),
@@ -887,10 +905,12 @@ def _merge_reviews_clean_fixed_staging(df_std: pd.DataFrame):
     client.query(merge_sql).result()
     logger.info("BQ MERGE reviews_clean done rows=%d (seq=STRING)", rows_written)
 
+# -----------------------------
+# “이번 파일 신규 대상” SQL (STRING 조인) + Exclusion 적용
+# -----------------------------
+_SQL_EXCL_BRAND_C = _sql_not_in_clause("c.brand_no", EXCLUDED_BRAND_NOS)
+_SQL_EXCL_PROD_C = _sql_not_in_clause("c.product_no", EXCLUDED_PRODUCT_NOS)
 
-# -----------------------------
-# “이번 파일 신규 대상” SQL (STRING 조인)
-# -----------------------------
 SQL_NEW_REVIEWS_FOR_FILE = f"""
 WITH file_rows AS (
   SELECT DISTINCT
@@ -913,6 +933,8 @@ targets AS (
   JOIN file_rows r
     ON c.review_no = r.review_no
    AND c.review_seq = r.review_seq
+  WHERE {_SQL_EXCL_BRAND_C}
+    AND {_SQL_EXCL_PROD_C}
 )
 SELECT t.*
 FROM targets t
@@ -920,7 +942,6 @@ LEFT JOIN `{PROJECT_ID}.{DATASET}.review_llm_extract` e
   ON e.review_key = t.review_key
 WHERE e.review_key IS NULL
 """
-
 
 # -----------------------------
 # Review-level prompt (Upgraded)
@@ -1003,7 +1024,6 @@ def _build_prompt(row: dict) -> str:
 {review_text}
 """.strip()
 
-
 # -----------------------------
 # Batch Input builder (review-level)
 # -----------------------------
@@ -1053,7 +1073,6 @@ def make_batch_input_jsonl_and_upload(bucket: str, object_name: str, generation:
     logger.info("BATCH INPUT uploaded: %s (rows=%d)", input_uri, rows_written)
     return input_uri
 
-
 def _normalize_model_name(model: str) -> str:
     """
     Batch(batches.create)에서 alias가 거부되는 케이스가 있어 stable version(-001)로 보정.
@@ -1072,7 +1091,6 @@ def _normalize_model_name(model: str) -> str:
     if "/" in m:
         return m
     return f"publishers/google/models/{m}"
-
 
 def submit_vertex_batch_job_global(input_jsonl_gcs_uri: str, object_name: str, generation: str) -> str:
     if not input_jsonl_gcs_uri:
@@ -1104,7 +1122,6 @@ def submit_vertex_batch_job_global(input_jsonl_gcs_uri: str, object_name: str, g
     )
     return job_name
 
-
 def _submit_vertex_batch_job_global_custom(input_jsonl_gcs_uri: str, output_prefix: str) -> str:
     if not input_jsonl_gcs_uri:
         return ""
@@ -1126,7 +1143,6 @@ def _submit_vertex_batch_job_global_custom(input_jsonl_gcs_uri: str, output_pref
     job_name = getattr(job, "name", "") or str(job)
     logger.info("BATCH SUBMITTED model=%s input=%s output=%s job=%s", model_name, input_jsonl_gcs_uri, output_prefix, job_name)
     return job_name
-
 
 # =========================================================
 # REVIEW-LEVEL (ARCHIVE): 임시 stg 테이블 + 스트리밍 파서/NDJSON writer
@@ -1159,7 +1175,6 @@ def _create_review_llm_temp_stg_table(stg_table: str):
     )
     """
     ).result()
-
 
 def _stream_review_predictions_to_stg_ndjson(local_predictions_path: str, out_ndjson_path: str) -> Tuple[int, List[str]]:
     """
@@ -1217,6 +1232,10 @@ def _stream_review_predictions_to_stg_ndjson(local_predictions_path: str, out_nd
                 if not review_key:
                     continue
 
+                # ✅ EXCLUDE (brand/product) - review-level 결과도 저장/집계 제외
+                if _is_excluded_brand_product(item.get("brand_no"), item.get("product_no")):
+                    continue
+
                 signals = item.get("signals") or {}
                 if not isinstance(signals, dict):
                     signals = {}
@@ -1245,10 +1264,9 @@ def _stream_review_predictions_to_stg_ndjson(local_predictions_path: str, out_nd
 
     return rows_written, sorted(review_keys_set)
 
-
 def _merge_review_llm_extract_from_staging(stg_table: str):
     """
-    (시그니처 변경) stg_table -> review_llm_extract 로 MERGE
+    stg_table -> review_llm_extract 로 MERGE
     """
     client = _bq()
 
@@ -1310,10 +1328,9 @@ def _merge_review_llm_extract_from_staging(stg_table: str):
     """
     client.query(merge_sql).result()
 
-
 def _merge_style_daily_metrics_for_staged_keys(stg_table: str):
     """
-    (시그니처 변경) style_daily_metrics 갱신:
+    style_daily_metrics 갱신:
     - 대상: 이번 stg_table에 들어온 review_key들
     - 집계: (write_date, brand_no, product_no, channel, issue_category)
     """
@@ -1376,10 +1393,8 @@ def _merge_style_daily_metrics_for_staged_keys(stg_table: str):
     """
     client.query(sql).result()
 
-
 # =========================================================
 # PRODUCT-LEVEL: prompts + build inputs + parse + merge
-# (아래부터는 기존 코드 유지)
 # =========================================================
 def _build_product_daily_prompt(
     batch_run_key: str,
@@ -1438,7 +1453,6 @@ REVIEWS_JSON_ARRAY:
 {reviews_json}
 """.strip()
 
-
 def _build_product_total_prompt(
     as_of_date: str,
     days_lookback: int,
@@ -1493,7 +1507,6 @@ DAILY_SUMMARIES_JSON_ARRAY:
 {daily_json}
 """.strip()
 
-
 def make_product_daily_batch_input_jsonl_and_upload(object_name: str, generation: str, review_keys: List[str]) -> str:
     """
     리뷰단위 결과(이번 invocation에서 처리한 review_keys) 기반으로,
@@ -1505,6 +1518,9 @@ def make_product_daily_batch_input_jsonl_and_upload(object_name: str, generation
     bq = _bq()
     gcs = _gcs()
 
+    excl_brand = _sql_not_in_clause("brand_no", EXCLUDED_BRAND_NOS)
+    excl_prod = _sql_not_in_clause("product_no", EXCLUDED_PRODUCT_NOS)
+
     sql_groups = f"""
     SELECT
       CAST(write_date AS DATE) AS metric_date,
@@ -1514,6 +1530,8 @@ def make_product_daily_batch_input_jsonl_and_upload(object_name: str, generation
     FROM `{TABLE_CLEAN}`
     WHERE review_key IN UNNEST(@keys)
       AND write_date IS NOT NULL
+      AND {excl_brand}
+      AND {excl_prod}
     GROUP BY metric_date, brand_no, product_no, channel
     """
     job_config = bigquery.QueryJobConfig(
@@ -1535,6 +1553,10 @@ def make_product_daily_batch_input_jsonl_and_upload(object_name: str, generation
             product_no = g["product_no"]
             channel = g["channel"]
 
+            # 최종 방어: 제외 대상이면 SKIP
+            if _is_excluded_brand_product(brand_no, product_no):
+                continue
+
             sql_reviews = f"""
             SELECT
               review_key,
@@ -1545,6 +1567,8 @@ def make_product_daily_batch_input_jsonl_and_upload(object_name: str, generation
               AND IFNULL(brand_no,'') = @brand_no
               AND IFNULL(product_no,'') = @product_no
               AND IFNULL(channel,'') = @channel
+              AND {excl_brand}
+              AND {excl_prod}
             ORDER BY review_key
             """
             qcfg = bigquery.QueryJobConfig(
@@ -1612,7 +1636,6 @@ def make_product_daily_batch_input_jsonl_and_upload(object_name: str, generation
     logger.info("PRODUCT_DAILY INPUT uploaded: %s (requests=%d)", input_uri, rows_written)
     return input_uri
 
-
 def make_product_total_batch_input_jsonl_and_upload(as_of_date: date, products: List[Tuple[str, str, str]]) -> str:
     """
     products: [(brand_no, product_no, channel), ...]
@@ -1625,13 +1648,17 @@ def make_product_total_batch_input_jsonl_and_upload(as_of_date: date, products: 
     gcs = _gcs()
 
     days_lookback = TOTAL_SUMMARY_LOOKBACK_DAYS
-    start_date = (as_of_date - pd.Timedelta(days=days_lookback)).date()
+    start_date = as_of_date - timedelta(days=days_lookback)
 
     tmp_path = f"/tmp/prod_total_input_{uuid.uuid4().hex}.jsonl"
     rows_written = 0
 
     with open(tmp_path, "w", encoding="utf-8") as f:
         for brand_no, product_no, channel in products:
+            # 제외 대상이면 product_total도 생성/제출 안 함
+            if _is_excluded_brand_product(brand_no, product_no):
+                continue
+
             sql = f"""
             SELECT
               metric_date,
@@ -1708,7 +1735,6 @@ def make_product_total_batch_input_jsonl_and_upload(as_of_date: date, products: 
     logger.info("PRODUCT_TOTAL INPUT uploaded: %s (requests=%d)", input_uri, rows_written)
     return input_uri
 
-
 def _parse_product_daily_predictions_to_rows(local_path: str, object_name: str, generation: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     brk = _batch_run_key(object_name, generation)
@@ -1750,6 +1776,10 @@ def _parse_product_daily_predictions_to_rows(local_path: str, object_name: str, 
             if not metric_date or not product_no:
                 continue
 
+            # ✅ 제외 대상 drop
+            if _is_excluded_brand_product(brand_no, product_no):
+                continue
+
             product_daily_key = f"{brk}::{metric_date}::{brand_no}::{product_no}::{channel}"
             evidence_list = parsed.get("evidence_list")
             evidence_str = json.dumps(evidence_list, ensure_ascii=False) if evidence_list is not None else None
@@ -1780,7 +1810,6 @@ def _parse_product_daily_predictions_to_rows(local_path: str, object_name: str, 
             )
 
     return rows
-
 
 def _parse_product_total_predictions_to_rows(local_path: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
@@ -1823,6 +1852,10 @@ def _parse_product_total_predictions_to_rows(local_path: str) -> List[Dict[str, 
             if not as_of_date or not product_no:
                 continue
 
+            # ✅ 제외 대상 drop
+            if _is_excluded_brand_product(brand_no, product_no):
+                continue
+
             product_total_key = f"{as_of_date}::{days_lookback}::{brand_no}::{product_no}::{channel}"
             evidence_list = parsed.get("evidence_list")
             evidence_str = json.dumps(evidence_list, ensure_ascii=False) if evidence_list is not None else None
@@ -1853,7 +1886,6 @@ def _parse_product_total_predictions_to_rows(local_path: str) -> List[Dict[str, 
             )
 
     return rows
-
 
 def _merge_product_daily_from_staging(stg_table: str):
     client = _bq()
@@ -1928,7 +1960,6 @@ def _merge_product_daily_from_staging(stg_table: str):
     """
     client.query(merge_sql).result()
 
-
 def _merge_product_total_from_staging(stg_table: str):
     client = _bq()
     merge_sql = f"""
@@ -2002,7 +2033,6 @@ def _merge_product_total_from_staging(stg_table: str):
     """
     client.query(merge_sql).result()
 
-
 # =========================================================
 # ARCHIVE ROUTE: unified handler (review outputs + product outputs)
 # =========================================================
@@ -2010,7 +2040,6 @@ def handle_archive_event(bucket: str, name: str, generation: str) -> Tuple[str, 
     """
     ARCHIVE_BUCKET 이벤트 처리 (확장):
     1) 리뷰 단위: batch_outputs/**/predictions*.jsonl -> review_llm_extract + metrics -> product_daily batch 제출
-       (개선) review-level STG를 "임시 테이블"로, 파서/NDJSON writer는 스트리밍으로
     2) 상품 일자 단위: batch_outputs_product_daily/**/predictions*.jsonl -> product_daily_feedback_llm
        -> style_daily_metrics에 라벨 자동 MERGE -> product_total batch 제출
     3) 상품 누적 단위: batch_outputs_product_total/**/predictions*.jsonl -> product_total_feedback_summary_llm
@@ -2127,13 +2156,16 @@ def handle_archive_event(bucket: str, name: str, generation: str) -> Tuple[str, 
         _load_ndjson_to_table(stg_table, tmp, write_disposition="WRITE_TRUNCATE")
         _merge_product_daily_from_staging(stg_table)
 
-        # ✅ NEW: product_daily 라벨을 style_daily_metrics에 자동으로 붙여넣기
+        # ✅ product_daily 라벨을 style_daily_metrics에 자동으로 붙여넣기
         _merge_style_daily_metrics_with_product_daily_labels_from_stg(stg_table)
 
         client.query(f"DROP TABLE `{stg_table}`").result()
 
         # product_total 제출: 이번 product_daily에서 나온 (brand, product, channel)만 대상으로
         products = list({(str(r.get("brand_no") or ""), str(r.get("product_no") or ""), str(r.get("channel") or "")) for r in rows})
+        # 제외 대상은 다시 한번 제거
+        products = [(b, p, c) for (b, p, c) in products if not _is_excluded_brand_product(b, p)]
+
         as_of = _now_utc().date()
         input_uri = make_product_total_batch_input_jsonl_and_upload(as_of_date=as_of, products=products)
         if input_uri:
@@ -2145,7 +2177,7 @@ def handle_archive_event(bucket: str, name: str, generation: str) -> Tuple[str, 
         logger.info("ARCHIVE processed product_daily rows=%d file=%s", len(rows), name)
         return ("DONE", f"PROD_DAILY_ROWS={len(rows)} TOTAL_JOB=SKIP_NO_TARGETS")
 
-    # ---- review-level outputs (개선 적용 구간)
+    # ---- review-level outputs
     if not n.startswith(BATCH_OUTPUT_PREFIX + "/"):
         return ("SKIP", f"archive route: not under known output prefixes name={name}")
 
@@ -2182,18 +2214,17 @@ def handle_archive_event(bucket: str, name: str, generation: str) -> Tuple[str, 
         logger.info("ARCHIVE processed review-level rows=%d file=%s", rows_written, name)
         return ("DONE", f"LLM_ROWS={rows_written} PROD_DAILY_JOB=SKIP_NO_TARGETS")
     finally:
-        # 임시 stg 테이블 정리
         try:
             client.query(f"DROP TABLE `{stg_table}`").result()
         except Exception as e:
             logger.warning("Failed to DROP temp stg table (non-fatal) table=%s err=%s", stg_table, str(e)[:300])
-
 
 # =========================================================
 # UPLOAD ROUTE: UPLOAD_BUCKET .xlsx -> raw/clean -> batch submit
 # =========================================================
 def handle_xlsx_upload_event(bucket: str, name: str, generation: str) -> Tuple[str, str]:
     logger.info("CONFIG UPLOAD_BUCKET=%s ARCHIVE_BUCKET=%s DATASET=%s", UPLOAD_BUCKET, ARCHIVE_BUCKET, DATASET)
+    logger.info("CONFIG EXCLUDED_BRANDS=%s EXCLUDED_PRODUCTS=%s", sorted(list(EXCLUDED_BRAND_NOS)), sorted(list(EXCLUDED_PRODUCT_NOS)))
 
     if bucket != UPLOAD_BUCKET:
         return ("SKIP", f"not target upload bucket: {bucket}")
@@ -2209,18 +2240,19 @@ def handle_xlsx_upload_event(bucket: str, name: str, generation: str) -> Tuple[s
 
     df_std = _load_excel_mapped(local_path)
 
+    # raw는 "원본 보관" 목적이라 제외하지 않음 (원하면 여기서도 필터 가능)
     if not _raw_already_loaded(bucket, name, generation):
         _append_reviews_raw_ndjson(df_std, bucket, name, generation)
     else:
         logger.info("SKIP reviews_raw already loaded for %s/%s gen=%s", bucket, name, generation)
 
+    # clean부터 제외 -> 이후 전체 분석 파이프라인 자동 제외
     _merge_reviews_clean_fixed_staging(df_std)
 
     input_uri = make_batch_input_jsonl_and_upload(bucket, name, generation)
     job_name = submit_vertex_batch_job_global(input_uri, name, generation)
 
     return ("DONE", f"BATCH_JOB={job_name}" if job_name else "NO_TARGETS")
-
 
 # -----------------------------
 # CloudEvent entrypoint (single service, two routes)
