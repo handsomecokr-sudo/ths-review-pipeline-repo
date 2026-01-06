@@ -58,10 +58,18 @@ BATCH_OUTPUT_PREFIX = (os.getenv("BATCH_OUTPUT_PREFIX") or "batch_outputs").stri
 PROMPT_VERSION = (os.getenv("PROMPT_VERSION") or "v1").strip()
 
 # Batch (product-level)
-BATCH_INPUT_PREFIX_PROD_DAILY = (os.getenv("BATCH_INPUT_PREFIX_PROD_DAILY") or "batch_inputs_product_daily").strip().strip("/")
-BATCH_OUTPUT_PREFIX_PROD_DAILY = (os.getenv("BATCH_OUTPUT_PREFIX_PROD_DAILY") or "batch_outputs_product_daily").strip().strip("/")
-BATCH_INPUT_PREFIX_PROD_TOTAL = (os.getenv("BATCH_INPUT_PREFIX_PROD_TOTAL") or "batch_inputs_product_total").strip().strip("/")
-BATCH_OUTPUT_PREFIX_PROD_TOTAL = (os.getenv("BATCH_OUTPUT_PREFIX_PROD_TOTAL") or "batch_outputs_product_total").strip().strip("/")
+BATCH_INPUT_PREFIX_PROD_DAILY = (os.getenv("BATCH_INPUT_PREFIX_PROD_DAILY") or "batch_inputs_product_daily").strip().strip(
+    "/"
+)
+BATCH_OUTPUT_PREFIX_PROD_DAILY = (os.getenv("BATCH_OUTPUT_PREFIX_PROD_DAILY") or "batch_outputs_product_daily").strip().strip(
+    "/"
+)
+BATCH_INPUT_PREFIX_PROD_TOTAL = (os.getenv("BATCH_INPUT_PREFIX_PROD_TOTAL") or "batch_inputs_product_total").strip().strip(
+    "/"
+)
+BATCH_OUTPUT_PREFIX_PROD_TOTAL = (os.getenv("BATCH_OUTPUT_PREFIX_PROD_TOTAL") or "batch_outputs_product_total").strip().strip(
+    "/"
+)
 
 MAX_REVIEWS_PER_PRODUCT_DAY = int(os.getenv("MAX_REVIEWS_PER_PRODUCT_DAY") or "2000")
 MAX_REVIEW_TEXT_CHARS_PRODUCT = int(os.getenv("MAX_REVIEW_TEXT_CHARS_PRODUCT") or "500")
@@ -72,17 +80,17 @@ TOTAL_SUMMARY_LOOKBACK_DAYS = int(os.getenv("TOTAL_SUMMARY_LOOKBACK_DAYS") or "3
 # - E0 브랜드 전체 제외
 # - 특정 상품코드 E02A5ZZZ999M 제외
 # -----------------------------
-EXCLUDED_BRAND_NOS = set(
-    [s.strip() for s in (os.getenv("EXCLUDED_BRAND_NOS") or "E0").split(",") if s.strip()]
-)
+EXCLUDED_BRAND_NOS = set([s.strip() for s in (os.getenv("EXCLUDED_BRAND_NOS") or "E0").split(",") if s.strip()])
 EXCLUDED_PRODUCT_NOS = set(
     [s.strip() for s in (os.getenv("EXCLUDED_PRODUCT_NOS") or "E02A5ZZZ999M").split(",") if s.strip()]
 )
+
 
 def _is_excluded_brand_product(brand_no: Any, product_no: Any) -> bool:
     b = str(brand_no or "").strip()
     p = str(product_no or "").strip()
     return (b in EXCLUDED_BRAND_NOS) or (p in EXCLUDED_PRODUCT_NOS)
+
 
 def _sql_not_in_clause(field_expr: str, values: set) -> str:
     """
@@ -148,11 +156,14 @@ EXPECTED_STD_COLS = [
 def _bq() -> bigquery.Client:
     return bigquery.Client(project=PROJECT_ID)
 
+
 def _gcs() -> storage.Client:
     return storage.Client(project=PROJECT_ID)
 
+
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
 
 # -----------------------------
 # Utils
@@ -191,6 +202,7 @@ def _normalize_write_date_to_ymd(v: Any) -> str:
     except Exception:
         return ""
 
+
 def _is_internal_object(name: str) -> bool:
     n = (name or "").lstrip("/")
     return (
@@ -204,11 +216,13 @@ def _is_internal_object(name: str) -> bool:
         or n.lower().endswith(".ndjson")
     )
 
+
 def _basename(path: str) -> str:
     p = (path or "").rstrip("/")
     if "/" not in p:
         return p
     return p.split("/")[-1]
+
 
 def _safe_json_extract(text: str) -> Optional[Any]:
     """
@@ -251,6 +265,7 @@ def _safe_json_extract(text: str) -> Optional[Any]:
     except Exception:
         return None
 
+
 def _parse_extracted_at_from_line(line_obj: dict) -> str:
     """
     batch output 라인에 processed_time 같은 값이 있으면 사용하고,
@@ -269,6 +284,7 @@ def _parse_extracted_at_from_line(line_obj: dict) -> str:
             except Exception:
                 continue
     return _now_utc().isoformat()
+
 
 def _extract_object_and_generation_from_archive_path(path: str, output_prefix: str) -> Tuple[str, str]:
     """
@@ -299,8 +315,10 @@ def _extract_object_and_generation_from_archive_path(path: str, output_prefix: s
     generation = parts[gen_idx]
     return (object_name, generation)
 
+
 def _batch_run_key(object_name: str, generation: str) -> str:
     return f"{object_name}::{generation}"
+
 
 def _is_low_quality_review_text(text: str) -> bool:
     s = (text or "").strip()
@@ -313,11 +331,53 @@ def _is_low_quality_review_text(text: str) -> bool:
         return True
     return False
 
+
 def _truncate_text(s: str, max_chars: int) -> str:
     s = (s or "").strip()
     if len(s) <= max_chars:
         return s
     return s[:max_chars] + "…"
+
+
+def _dedupe_keywords_from_proofs(proofs: Any, max_n: int = 10) -> Tuple[str, List[dict]]:
+    """
+    proofs expected:
+      [
+        {"keyword":"", "desc":"", "evidence":[{"review_key":"", "quote":""}, ...]},
+        ...
+      ]
+    returns:
+      ( "kw1|kw2|...", cleaned_proofs_list )
+    """
+    if not isinstance(proofs, list):
+        proofs = []
+
+    cleaned: List[dict] = []
+    seen = set()
+    keywords: List[str] = []
+
+    for it in proofs:
+        if not isinstance(it, dict):
+            continue
+        kw = str(it.get("keyword") or "").strip()
+        if not kw:
+            continue
+        if kw in seen:
+            continue
+
+        seen.add(kw)
+        desc = str(it.get("desc") or "").strip()
+        ev = it.get("evidence")
+        if not isinstance(ev, list):
+            ev = []
+        keywords.append(kw)
+        cleaned.append({"keyword": kw, "desc": desc, "evidence": ev[:5]})
+
+        if len(cleaned) >= max_n:
+            break
+
+    return ("|".join(keywords), cleaned)
+
 
 # -----------------------------
 # XLSX Validation / Download
@@ -327,6 +387,7 @@ def _download_from_gcs(bucket: str, name: str, suffix: str = "") -> str:
     client = _gcs()
     client.bucket(bucket).blob(name).download_to_filename(local_path)
     return local_path
+
 
 def _assert_xlsx(local_path: str, object_name: str):
     if not object_name.lower().endswith(".xlsx"):
@@ -343,6 +404,7 @@ def _assert_xlsx(local_path: str, object_name: str):
     except zipfile.BadZipFile:
         raise ValueError("Uploaded file is not a valid .xlsx (bad zip archive)")
 
+
 def _load_excel_mapped(path: str) -> pd.DataFrame:
     df = pd.read_excel(path, engine="openpyxl")
     df.columns = [str(c).strip() for c in df.columns]
@@ -353,6 +415,7 @@ def _load_excel_mapped(path: str) -> pd.DataFrame:
         raise ValueError(f"컬럼 매핑 후 누락: {missing}. 현재 컬럼={list(df.columns)}")
 
     return df[EXPECTED_STD_COLS].copy()
+
 
 # -----------------------------
 # BigQuery helpers
@@ -371,6 +434,7 @@ def _ensure_ingestion_table():
     )
     """
     ).result()
+
 
 def _load_ndjson_to_table(table_id: str, local_ndjson_path: str, write_disposition: str):
     """
@@ -431,6 +495,7 @@ def _load_ndjson_to_table(table_id: str, local_ndjson_path: str, write_dispositi
 
     job.result()
 
+
 def _already_done(bucket: str, object_name: str, generation: str) -> bool:
     client = _bq()
     sql = f"""
@@ -449,6 +514,7 @@ def _already_done(bucket: str, object_name: str, generation: str) -> bool:
     )
     rows = list(client.query(sql, job_config=job_config).result())
     return bool(rows) and rows[0]["status"] == "DONE"
+
 
 def _mark_ingestion(
     status: str,
@@ -474,6 +540,7 @@ def _mark_ingestion(
     )
     client.query(sql, job_config=job_config).result()
 
+
 def _raw_already_loaded(bucket: str, object_name: str, generation: str) -> bool:
     client = _bq()
     sql = f"""
@@ -491,6 +558,7 @@ def _raw_already_loaded(bucket: str, object_name: str, generation: str) -> bool:
     )
     rows = list(client.query(sql, job_config=job_config).result())
     return bool(rows)
+
 
 def _ensure_product_tables():
     """
@@ -519,6 +587,16 @@ def _ensure_product_tables():
       repurchase_intent STRING,
 
       evidence_list STRING,
+
+      -- NEW columns (keywords/proofs + score/counts)
+      pos_keywords STRING,
+      neg_keywords STRING,
+      pos_proofs JSON,
+      neg_proofs JSON,
+      score_0_100 INT64,
+      total_review_cnt INT64,
+      pos_review_cnt INT64,
+      neg_review_cnt INT64,
 
       extracted_at TIMESTAMP,
       model_name STRING,
@@ -550,6 +628,16 @@ def _ensure_product_tables():
 
       evidence_list STRING,
 
+      -- NEW columns (keywords/proofs + score/counts)
+      pos_keywords STRING,
+      neg_keywords STRING,
+      pos_proofs JSON,
+      neg_proofs JSON,
+      score_0_100 INT64,
+      total_review_cnt INT64,
+      pos_review_cnt INT64,
+      neg_review_cnt INT64,
+
       extracted_at TIMESTAMP,
       model_name STRING,
       model_version STRING,
@@ -558,6 +646,7 @@ def _ensure_product_tables():
     )
     """
     ).result()
+
 
 def _ensure_style_metrics_product_label_columns():
     """
@@ -599,6 +688,7 @@ def _ensure_style_metrics_product_label_columns():
         logger.info("style_daily_metrics columns added: %s", [c for c, _ in missing])
     except Exception as e:
         logger.warning("Failed to ALTER style_daily_metrics (non-fatal). err=%s", str(e)[:500])
+
 
 def _merge_style_daily_metrics_with_product_daily_labels_from_stg(stg_prod_daily_table: str):
     """
@@ -701,6 +791,7 @@ def _merge_style_daily_metrics_with_product_daily_labels_from_stg(stg_prod_daily
     except Exception as e:
         logger.warning("Failed to MERGE product labels into style_daily_metrics (non-fatal). err=%s", str(e)[:500])
 
+
 # -----------------------------
 # reviews_raw append (NDJSON load)
 # -----------------------------
@@ -737,6 +828,7 @@ def _append_reviews_raw_ndjson(df_std: pd.DataFrame, bucket: str, name: str, gen
 
     _load_ndjson_to_table(TABLE_RAW, tmp, write_disposition="WRITE_APPEND")
     logger.info("BQ append reviews_raw rows=%d ingest_id=%s", rows_written, base_ingest_id)
+
 
 # -----------------------------
 # reviews_clean MERGE (review_seq STRING) + Exclusion 적용
@@ -905,6 +997,7 @@ def _merge_reviews_clean_fixed_staging(df_std: pd.DataFrame):
     client.query(merge_sql).result()
     logger.info("BQ MERGE reviews_clean done rows=%d (seq=STRING)", rows_written)
 
+
 # -----------------------------
 # “이번 파일 신규 대상” SQL (STRING 조인) + Exclusion 적용
 # -----------------------------
@@ -942,6 +1035,7 @@ LEFT JOIN `{PROJECT_ID}.{DATASET}.review_llm_extract` e
   ON e.review_key = t.review_key
 WHERE e.review_key IS NULL
 """
+
 
 # -----------------------------
 # Review-level prompt (Upgraded)
@@ -1024,6 +1118,7 @@ def _build_prompt(row: dict) -> str:
 {review_text}
 """.strip()
 
+
 # -----------------------------
 # Batch Input builder (review-level)
 # -----------------------------
@@ -1073,6 +1168,7 @@ def make_batch_input_jsonl_and_upload(bucket: str, object_name: str, generation:
     logger.info("BATCH INPUT uploaded: %s (rows=%d)", input_uri, rows_written)
     return input_uri
 
+
 def _normalize_model_name(model: str) -> str:
     """
     Batch(batches.create)에서 alias가 거부되는 케이스가 있어 stable version(-001)로 보정.
@@ -1091,6 +1187,7 @@ def _normalize_model_name(model: str) -> str:
     if "/" in m:
         return m
     return f"publishers/google/models/{m}"
+
 
 def submit_vertex_batch_job_global(input_jsonl_gcs_uri: str, object_name: str, generation: str) -> str:
     if not input_jsonl_gcs_uri:
@@ -1122,6 +1219,7 @@ def submit_vertex_batch_job_global(input_jsonl_gcs_uri: str, object_name: str, g
     )
     return job_name
 
+
 def _submit_vertex_batch_job_global_custom(input_jsonl_gcs_uri: str, output_prefix: str) -> str:
     if not input_jsonl_gcs_uri:
         return ""
@@ -1143,6 +1241,7 @@ def _submit_vertex_batch_job_global_custom(input_jsonl_gcs_uri: str, output_pref
     job_name = getattr(job, "name", "") or str(job)
     logger.info("BATCH SUBMITTED model=%s input=%s output=%s job=%s", model_name, input_jsonl_gcs_uri, output_prefix, job_name)
     return job_name
+
 
 # =========================================================
 # REVIEW-LEVEL (ARCHIVE): 임시 stg 테이블 + 스트리밍 파서/NDJSON writer
@@ -1175,6 +1274,7 @@ def _create_review_llm_temp_stg_table(stg_table: str):
     )
     """
     ).result()
+
 
 def _stream_review_predictions_to_stg_ndjson(local_predictions_path: str, out_ndjson_path: str) -> Tuple[int, List[str]]:
     """
@@ -1264,6 +1364,7 @@ def _stream_review_predictions_to_stg_ndjson(local_predictions_path: str, out_nd
 
     return rows_written, sorted(review_keys_set)
 
+
 def _merge_review_llm_extract_from_staging(stg_table: str):
     """
     stg_table -> review_llm_extract 로 MERGE
@@ -1328,6 +1429,7 @@ def _merge_review_llm_extract_from_staging(stg_table: str):
     """
     client.query(merge_sql).result()
 
+
 def _merge_style_daily_metrics_for_staged_keys(stg_table: str):
     """
     style_daily_metrics 갱신:
@@ -1370,7 +1472,7 @@ def _merge_style_daily_metrics_for_staged_keys(stg_table: str):
           issue_category,
           COUNT(1) AS review_cnt,
           SUM(CASE WHEN sentiment IN ('불만','강한불만') THEN 1 ELSE 0 END) AS neg_cnt,
-          SUM(CASE WHEN severity IN ('중대','심각','치명') THEN 1 ELSE 0 END) AS severe_cnt,
+          SUM(CASE WHEN severity IN ('심각','치명') THEN 1 ELSE 0 END) AS severe_cnt,
           AVG(SAFE_CAST(review_score AS FLOAT64)) AS avg_rating
         FROM joined
         GROUP BY metric_date, brand_no, product_no, channel, issue_category
@@ -1392,6 +1494,7 @@ def _merge_style_daily_metrics_for_staged_keys(stg_table: str):
       VALUES (S.metric_date, S.brand_no, S.product_no, S.channel, S.issue_category, S.review_cnt, S.neg_cnt, S.severe_cnt, S.avg_rating)
     """
     client.query(sql).result()
+
 
 # =========================================================
 # PRODUCT-LEVEL: prompts + build inputs + parse + merge
@@ -1418,6 +1521,26 @@ def _build_product_daily_prompt(
 4) evidence_list에는 반드시 리뷰 원문에서 직접 따온 짧은 인용(최대 40자) 2~5개를 넣고, 각각 review_key를 포함하라.
 5) 절대 임의로 사실을 만들어내지 말고, 근거 부족 시 보수적으로 "불명"/"중립"을 사용하라.
 
+요약 길이/구성:
+6) weekly_feedback는 최소 100자 이상 + 최소 3문장.
+   - 구성: (A)요약 1문장 (B)만족 포인트 1문장 (C)불만/아쉬움 1문장 (D)구매/추천 관점 1문장(가능하면).
+   - 100자 미만이거나 문장이 부족하면 반드시 보강해서 기준을 넘겨라.
+
+키워드/근거:
+7) pos_proofs / neg_proofs 는 각각 1~10개.
+   - 각 항목은 반드시 {{"keyword","desc","evidence"}} 포함.
+   - evidence는 1~5개 인용(각 40자 이내, review_key 필수).
+8) 키워드 다양성/중복 억제:
+   - pos_proofs/neg_proofs 안에서 keyword는 서로 완전히 달라야 한다(중복 금지).
+   - pos와 neg 사이에서도 keyword가 겹치면 안 된다.
+   - 너무 일반적인 단어(예: "좋아요","별로","보통","만족","불만","예쁨")는 keyword로 금지.
+     대신 구체 속성(핏/사이즈/기장/소재/원단감/두께/비침/색감/광택/마감/봉제/지퍼/단추/내구성/가죽/가격/가성비/디자인/실루엣/활용도/배송/포장 등)으로 써라.
+   - 같은 의미의 변형/동의어(예: "가성비"/"가격", "핏"/"착용감")를 동시에 넣지 말고 대표 1개만 선택하라.
+   - 가능하면 서로 다른 범주의 키워드로 분산하라(최소 3개 이상일 때: 핏/소재/가격/색/마감/디자인 등 분산).
+9) 최종 점검(스스로 수행):
+   - weekly_feedback가 100자 미만이면 문장을 추가해 100자를 넘겨라.
+   - 키워드가 중복되거나 일반단어면 제거/치환해서 유니크하고 구체적으로 만들어라.
+
 허용값(정확히 이 값만):
 - severity: ["없음","경미","보통","심각","치명"]
 - sentiment: ["강한불만","불만","중립","만족","강한칭찬"]
@@ -1426,7 +1549,7 @@ def _build_product_daily_prompt(
 - color_mentioned: ["없음","색상차이","변색","이염","비침","광택/톤","불명"]
 - repurchase_intent: ["확실히있음","있음","불명","없음","절대없음"]
 
-출력 스키마(키 이름 고정):
+출력 스키마(키 이름 고정, 누락/추가 금지):
 {{
   "batch_run_key": "{batch_run_key}",
   "metric_date": "{metric_date}",
@@ -1445,6 +1568,13 @@ def _build_product_daily_prompt(
 
   "evidence_list": [
     {{"review_key":"","quote":""}}
+  ],
+
+  "pos_proofs": [
+    {{"keyword":"","desc":"","evidence":[{{"review_key":"","quote":""}}]}}
+  ],
+  "neg_proofs": [
+    {{"keyword":"","desc":"","evidence":[{{"review_key":"","quote":""}}]}}
   ]
 }}
 
@@ -1452,6 +1582,7 @@ def _build_product_daily_prompt(
 REVIEWS_JSON_ARRAY:
 {reviews_json}
 """.strip()
+
 
 def _build_product_total_prompt(
     as_of_date: str,
@@ -1472,6 +1603,25 @@ def _build_product_total_prompt(
 2) 단일 라벨로 단정하기 어려우면 보수적으로 "중립"/"불명"을 사용하라.
 3) evidence_list는 일자별 총평 문구에서 짧게 인용하여 2~5개 넣고 metric_date를 함께 적어라.
 
+요약 길이/구성:
+4) total_feedback_summary는 최소 200자 이상 + 최소 4문장.
+   - 구성: (A)누적 핵심요약 1문장 (B)지속 칭찬 포인트 1~2문장 (C)지속 불만/리스크 1~2문장 (D)구매/추천/주의 1문장
+   - 200자 미만이면 반드시 보강해서 기준을 넘겨라.
+
+키워드/근거:
+5) pos_proofs / neg_proofs 는 각각 1~10개.
+   - evidence는 1~5개이며 각 evidence는 {{"metric_date","quote"}} 포함(quote 40자 이내).
+6) 키워드 산출 방식: 일자별 summary를 보고 "핵심 속성 키워드"를 재추출한다.
+   - 너무 일반적인 단어(좋아요/별로/만족/불만/예쁨 등)는 keyword 금지.
+7) 키워드 다양성/중복 억제:
+   - pos_proofs/neg_proofs 내부 keyword 중복 금지
+   - pos와 neg 간 keyword 중복 금지
+   - 동의어/유사어는 하나만 대표 선택(가성비/가격 등)
+   - 가능한 서로 다른 범주로 분산(핏/소재/가격/색/마감/디자인/내구성 등)
+8) 최종 점검(스스로 수행):
+   - total_feedback_summary 200자 미만이면 문장 추가.
+   - 키워드 중복/일반단어 있으면 교체.
+
 허용값(정확히 이 값만):
 - severity: ["없음","경미","보통","심각","치명"]
 - sentiment: ["강한불만","불만","중립","만족","강한칭찬"]
@@ -1480,7 +1630,7 @@ def _build_product_total_prompt(
 - color_mentioned: ["없음","색상차이","변색","이염","비침","광택/톤","불명"]
 - repurchase_intent: ["확실히있음","있음","불명","없음","절대없음"]
 
-출력 스키마(키 이름 고정):
+출력 스키마(키 이름 고정, 누락/추가 금지):
 {{
   "as_of_date": "{as_of_date}",
   "days_lookback": {days_lookback},
@@ -1499,6 +1649,13 @@ def _build_product_total_prompt(
 
   "evidence_list": [
     {{"metric_date":"","quote":""}}
+  ],
+
+  "pos_proofs": [
+    {{"keyword":"","desc":"","evidence":[{{"metric_date":"","quote":""}}]}}
+  ],
+  "neg_proofs": [
+    {{"keyword":"","desc":"","evidence":[{{"metric_date":"","quote":""}}]}}
   ]
 }}
 
@@ -1506,6 +1663,7 @@ def _build_product_total_prompt(
 DAILY_SUMMARIES_JSON_ARRAY:
 {daily_json}
 """.strip()
+
 
 def make_product_daily_batch_input_jsonl_and_upload(object_name: str, generation: str, review_keys: List[str]) -> str:
     """
@@ -1534,9 +1692,7 @@ def make_product_daily_batch_input_jsonl_and_upload(object_name: str, generation
       AND {excl_prod}
     GROUP BY metric_date, brand_no, product_no, channel
     """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ArrayQueryParameter("keys", "STRING", review_keys)]
-    )
+    job_config = bigquery.QueryJobConfig(query_parameters=[bigquery.ArrayQueryParameter("keys", "STRING", review_keys)])
     groups = list(bq.query(sql_groups, job_config=job_config).result())
     if not groups:
         return ""
@@ -1619,7 +1775,7 @@ def make_product_daily_batch_input_jsonl_and_upload(object_name: str, generation
                     "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                     "generationConfig": {
                         "temperature": 0.2,
-                        "maxOutputTokens": 512,
+                        "maxOutputTokens": 768,  # NEW: summary+proofs 충분히
                         "responseMimeType": "application/json",
                     },
                 }
@@ -1635,6 +1791,7 @@ def make_product_daily_batch_input_jsonl_and_upload(object_name: str, generation
     input_uri = f"gs://{ARCHIVE_BUCKET}/{dest_blob}"
     logger.info("PRODUCT_DAILY INPUT uploaded: %s (requests=%d)", input_uri, rows_written)
     return input_uri
+
 
 def make_product_total_batch_input_jsonl_and_upload(as_of_date: date, products: List[Tuple[str, str, str]]) -> str:
     """
@@ -1668,7 +1825,13 @@ def make_product_total_batch_input_jsonl_and_upload(as_of_date: date, products: 
               size_feedback,
               defect_part,
               color_mentioned,
-              repurchase_intent
+              repurchase_intent,
+              pos_keywords,
+              neg_keywords,
+              score_0_100,
+              total_review_cnt,
+              pos_review_cnt,
+              neg_review_cnt
             FROM `{TABLE_PROD_DAILY}`
             WHERE metric_date BETWEEN @start_date AND @as_of_date
               AND IFNULL(brand_no,'') = @brand_no
@@ -1698,6 +1861,13 @@ def make_product_total_batch_input_jsonl_and_upload(as_of_date: date, products: 
                         "defect_part": str(r.get("defect_part") or ""),
                         "color_mentioned": str(r.get("color_mentioned") or ""),
                         "repurchase_intent": str(r.get("repurchase_intent") or ""),
+                        # NEW: total이 daily 요약을 보고 재추출하되, 힌트로 제공
+                        "pos_keywords": str(r.get("pos_keywords") or ""),
+                        "neg_keywords": str(r.get("neg_keywords") or ""),
+                        "score_0_100": r.get("score_0_100"),
+                        "total_review_cnt": r.get("total_review_cnt"),
+                        "pos_review_cnt": r.get("pos_review_cnt"),
+                        "neg_review_cnt": r.get("neg_review_cnt"),
                     }
                 )
 
@@ -1718,7 +1888,7 @@ def make_product_total_batch_input_jsonl_and_upload(as_of_date: date, products: 
                     "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                     "generationConfig": {
                         "temperature": 0.2,
-                        "maxOutputTokens": 512,
+                        "maxOutputTokens": 768,  # NEW: 200자+proofs 충분히
                         "responseMimeType": "application/json",
                     },
                 }
@@ -1734,6 +1904,7 @@ def make_product_total_batch_input_jsonl_and_upload(as_of_date: date, products: 
     input_uri = f"gs://{ARCHIVE_BUCKET}/{dest_blob}"
     logger.info("PRODUCT_TOTAL INPUT uploaded: %s (requests=%d)", input_uri, rows_written)
     return input_uri
+
 
 def _parse_product_daily_predictions_to_rows(local_path: str, object_name: str, generation: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
@@ -1784,6 +1955,9 @@ def _parse_product_daily_predictions_to_rows(local_path: str, object_name: str, 
             evidence_list = parsed.get("evidence_list")
             evidence_str = json.dumps(evidence_list, ensure_ascii=False) if evidence_list is not None else None
 
+            pos_kw, pos_clean = _dedupe_keywords_from_proofs(parsed.get("pos_proofs"), max_n=10)
+            neg_kw, neg_clean = _dedupe_keywords_from_proofs(parsed.get("neg_proofs"), max_n=10)
+
             rows.append(
                 {
                     "product_daily_key": product_daily_key,
@@ -1801,6 +1975,11 @@ def _parse_product_daily_predictions_to_rows(local_path: str, object_name: str, 
                     "color_mentioned": str(parsed.get("color_mentioned") or "").strip(),
                     "repurchase_intent": str(parsed.get("repurchase_intent") or "").strip(),
                     "evidence_list": evidence_str,
+                    # NEW
+                    "pos_keywords": pos_kw,
+                    "neg_keywords": neg_kw,
+                    "pos_proofs_str": json.dumps(pos_clean, ensure_ascii=False),
+                    "neg_proofs_str": json.dumps(neg_clean, ensure_ascii=False),
                     "extracted_at": extracted_at,
                     "model_name": model_name,
                     "model_version": model_version,
@@ -1810,6 +1989,7 @@ def _parse_product_daily_predictions_to_rows(local_path: str, object_name: str, 
             )
 
     return rows
+
 
 def _parse_product_total_predictions_to_rows(local_path: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
@@ -1860,6 +2040,9 @@ def _parse_product_total_predictions_to_rows(local_path: str) -> List[Dict[str, 
             evidence_list = parsed.get("evidence_list")
             evidence_str = json.dumps(evidence_list, ensure_ascii=False) if evidence_list is not None else None
 
+            pos_kw, pos_clean = _dedupe_keywords_from_proofs(parsed.get("pos_proofs"), max_n=10)
+            neg_kw, neg_clean = _dedupe_keywords_from_proofs(parsed.get("neg_proofs"), max_n=10)
+
             rows.append(
                 {
                     "product_total_key": product_total_key,
@@ -1877,6 +2060,11 @@ def _parse_product_total_predictions_to_rows(local_path: str) -> List[Dict[str, 
                     "color_mentioned": str(parsed.get("color_mentioned") or "").strip(),
                     "repurchase_intent": str(parsed.get("repurchase_intent") or "").strip(),
                     "evidence_list": evidence_str,
+                    # NEW
+                    "pos_keywords": pos_kw,
+                    "neg_keywords": neg_kw,
+                    "pos_proofs_str": json.dumps(pos_clean, ensure_ascii=False),
+                    "neg_proofs_str": json.dumps(neg_clean, ensure_ascii=False),
                     "extracted_at": extracted_at,
                     "model_name": model_name,
                     "model_version": model_version,
@@ -1886,6 +2074,7 @@ def _parse_product_total_predictions_to_rows(local_path: str) -> List[Dict[str, 
             )
 
     return rows
+
 
 def _merge_product_daily_from_staging(stg_table: str):
     client = _bq()
@@ -1921,6 +2110,11 @@ def _merge_product_daily_from_staging(stg_table: str):
 
       evidence_list = CAST(S.evidence_list AS STRING),
 
+      pos_keywords = CAST(S.pos_keywords AS STRING),
+      neg_keywords = CAST(S.neg_keywords AS STRING),
+      pos_proofs = SAFE.PARSE_JSON(CAST(S.pos_proofs_str AS STRING)),
+      neg_proofs = SAFE.PARSE_JSON(CAST(S.neg_proofs_str AS STRING)),
+
       extracted_at = SAFE_CAST(NULLIF(CAST(S.extracted_at AS STRING), '') AS TIMESTAMP),
       model_name = CAST(S.model_name AS STRING),
       model_version = CAST(S.model_version AS STRING),
@@ -1930,7 +2124,9 @@ def _merge_product_daily_from_staging(stg_table: str):
       INSERT (
         product_daily_key, batch_run_key, metric_date, brand_no, product_no, channel, review_cnt,
         weekly_feedback, severity, sentiment, size_feedback, defect_part, color_mentioned, repurchase_intent,
-        evidence_list, extracted_at, model_name, model_version, prompt_version, raw_json
+        evidence_list,
+        pos_keywords, neg_keywords, pos_proofs, neg_proofs,
+        extracted_at, model_name, model_version, prompt_version, raw_json
       )
       VALUES (
         CAST(S.product_daily_key AS STRING),
@@ -1951,6 +2147,11 @@ def _merge_product_daily_from_staging(stg_table: str):
 
         CAST(S.evidence_list AS STRING),
 
+        CAST(S.pos_keywords AS STRING),
+        CAST(S.neg_keywords AS STRING),
+        SAFE.PARSE_JSON(CAST(S.pos_proofs_str AS STRING)),
+        SAFE.PARSE_JSON(CAST(S.neg_proofs_str AS STRING)),
+
         SAFE_CAST(NULLIF(CAST(S.extracted_at AS STRING), '') AS TIMESTAMP),
         CAST(S.model_name AS STRING),
         CAST(S.model_version AS STRING),
@@ -1959,6 +2160,7 @@ def _merge_product_daily_from_staging(stg_table: str):
       )
     """
     client.query(merge_sql).result()
+
 
 def _merge_product_total_from_staging(stg_table: str):
     client = _bq()
@@ -1994,6 +2196,11 @@ def _merge_product_total_from_staging(stg_table: str):
 
       evidence_list = CAST(S.evidence_list AS STRING),
 
+      pos_keywords = CAST(S.pos_keywords AS STRING),
+      neg_keywords = CAST(S.neg_keywords AS STRING),
+      pos_proofs = SAFE.PARSE_JSON(CAST(S.pos_proofs_str AS STRING)),
+      neg_proofs = SAFE.PARSE_JSON(CAST(S.neg_proofs_str AS STRING)),
+
       extracted_at = SAFE_CAST(NULLIF(CAST(S.extracted_at AS STRING), '') AS TIMESTAMP),
       model_name = CAST(S.model_name AS STRING),
       model_version = CAST(S.model_version AS STRING),
@@ -2003,7 +2210,9 @@ def _merge_product_total_from_staging(stg_table: str):
       INSERT (
         product_total_key, as_of_date, days_lookback, brand_no, product_no, channel, daily_summary_cnt,
         total_feedback_summary, severity, sentiment, size_feedback, defect_part, color_mentioned, repurchase_intent,
-        evidence_list, extracted_at, model_name, model_version, prompt_version, raw_json
+        evidence_list,
+        pos_keywords, neg_keywords, pos_proofs, neg_proofs,
+        extracted_at, model_name, model_version, prompt_version, raw_json
       )
       VALUES (
         CAST(S.product_total_key AS STRING),
@@ -2024,6 +2233,11 @@ def _merge_product_total_from_staging(stg_table: str):
 
         CAST(S.evidence_list AS STRING),
 
+        CAST(S.pos_keywords AS STRING),
+        CAST(S.neg_keywords AS STRING),
+        SAFE.PARSE_JSON(CAST(S.pos_proofs_str AS STRING)),
+        SAFE.PARSE_JSON(CAST(S.neg_proofs_str AS STRING)),
+
         SAFE_CAST(NULLIF(CAST(S.extracted_at AS STRING), '') AS TIMESTAMP),
         CAST(S.model_name AS STRING),
         CAST(S.model_version AS STRING),
@@ -2032,6 +2246,136 @@ def _merge_product_total_from_staging(stg_table: str):
       )
     """
     client.query(merge_sql).result()
+
+
+def _update_product_daily_counts_and_score_for_stg(stg_prod_daily_table: str):
+    """
+    product_daily_feedback_llm에:
+    - total_review_cnt / pos_review_cnt / neg_review_cnt
+    - score_0_100 (평점 우선, 없으면 sentiment 맵핑)
+    를 채움. (대상은 이번 stg에 포함된 product_daily_key만)
+    """
+    client = _bq()
+    sql = f"""
+    MERGE `{TABLE_PROD_DAILY}` T
+    USING (
+      WITH targets AS (
+        SELECT DISTINCT
+          product_daily_key,
+          SAFE_CAST(NULLIF(CAST(metric_date AS STRING), '') AS DATE) AS metric_date,
+          IFNULL(CAST(brand_no AS STRING), '') AS brand_no,
+          IFNULL(CAST(product_no AS STRING), '') AS product_no,
+          IFNULL(CAST(channel AS STRING), '') AS channel
+        FROM `{stg_prod_daily_table}`
+        WHERE product_daily_key IS NOT NULL AND product_daily_key != ''
+      ),
+      joined AS (
+        SELECT
+          t.product_daily_key,
+          c.review_key,
+          c.review_score,
+          e.sentiment
+        FROM targets t
+        JOIN `{TABLE_CLEAN}` c
+          ON c.write_date = t.metric_date
+         AND IFNULL(c.brand_no,'') = t.brand_no
+         AND IFNULL(c.product_no,'') = t.product_no
+         AND IFNULL(c.channel,'') = t.channel
+        LEFT JOIN `{TABLE_LLM}` e
+          ON e.review_key = c.review_key
+      ),
+      scored AS (
+        SELECT
+          product_daily_key,
+          COUNT(1) AS total_review_cnt,
+          SUM(CASE WHEN sentiment IN ('만족','강한칭찬') THEN 1 ELSE 0 END) AS pos_review_cnt,
+          SUM(CASE WHEN sentiment IN ('불만','강한불만') THEN 1 ELSE 0 END) AS neg_review_cnt,
+          ROUND(AVG(
+            CASE
+              WHEN review_score IS NOT NULL THEN (CAST(review_score AS FLOAT64) - 1.0) * 25.0
+              WHEN sentiment = '강한불만' THEN 0
+              WHEN sentiment = '불만' THEN 25
+              WHEN sentiment = '중립' THEN 50
+              WHEN sentiment = '만족' THEN 75
+              WHEN sentiment = '강한칭찬' THEN 100
+              ELSE 50
+            END
+          )) AS score_0_100
+        FROM joined
+        GROUP BY product_daily_key
+      )
+      SELECT * FROM scored
+    ) S
+    ON T.product_daily_key = S.product_daily_key
+    WHEN MATCHED THEN UPDATE SET
+      total_review_cnt = S.total_review_cnt,
+      pos_review_cnt = S.pos_review_cnt,
+      neg_review_cnt = S.neg_review_cnt,
+      score_0_100 = SAFE_CAST(S.score_0_100 AS INT64)
+    """
+    client.query(sql).result()
+
+
+def _update_product_total_counts_and_score_for_stg(stg_prod_total_table: str):
+    """
+    product_total_feedback_summary_llm에:
+    - total_review_cnt / pos_review_cnt / neg_review_cnt (일자별 합)
+    - score_0_100 (일자별 score_0_100의 리뷰수 가중평균)
+    를 채움. (대상은 이번 stg에 포함된 product_total_key만)
+    """
+    client = _bq()
+    sql = f"""
+    MERGE `{TABLE_PROD_TOTAL}` T
+    USING (
+      WITH targets AS (
+        SELECT DISTINCT
+          product_total_key,
+          SAFE_CAST(NULLIF(CAST(as_of_date AS STRING), '') AS DATE) AS as_of_date,
+          SAFE_CAST(NULLIF(CAST(days_lookback AS STRING), '') AS INT64) AS days_lookback,
+          IFNULL(CAST(brand_no AS STRING), '') AS brand_no,
+          IFNULL(CAST(product_no AS STRING), '') AS product_no,
+          IFNULL(CAST(channel AS STRING), '') AS channel
+        FROM `{stg_prod_total_table}`
+        WHERE product_total_key IS NOT NULL AND product_total_key != ''
+      ),
+      daily AS (
+        SELECT
+          t.product_total_key,
+          d.total_review_cnt,
+          d.pos_review_cnt,
+          d.neg_review_cnt,
+          d.score_0_100
+        FROM targets t
+        JOIN `{TABLE_PROD_DAILY}` d
+          ON d.metric_date BETWEEN DATE_SUB(t.as_of_date, INTERVAL t.days_lookback DAY) AND t.as_of_date
+         AND IFNULL(d.brand_no,'') = t.brand_no
+         AND IFNULL(d.product_no,'') = t.product_no
+         AND IFNULL(d.channel,'') = t.channel
+      ),
+      agg AS (
+        SELECT
+          product_total_key,
+          SUM(IFNULL(total_review_cnt,0)) AS total_review_cnt,
+          SUM(IFNULL(pos_review_cnt,0)) AS pos_review_cnt,
+          SUM(IFNULL(neg_review_cnt,0)) AS neg_review_cnt,
+          ROUND(SAFE_DIVIDE(
+            SUM(CAST(IFNULL(score_0_100,50) AS FLOAT64) * CAST(IFNULL(total_review_cnt,0) AS FLOAT64)),
+            NULLIF(SUM(CAST(IFNULL(total_review_cnt,0) AS FLOAT64)), 0)
+          )) AS score_0_100
+        FROM daily
+        GROUP BY product_total_key
+      )
+      SELECT * FROM agg
+    ) S
+    ON T.product_total_key = S.product_total_key
+    WHEN MATCHED THEN UPDATE SET
+      total_review_cnt = S.total_review_cnt,
+      pos_review_cnt = S.pos_review_cnt,
+      neg_review_cnt = S.neg_review_cnt,
+      score_0_100 = SAFE_CAST(S.score_0_100 AS INT64)
+    """
+    client.query(sql).result()
+
 
 # =========================================================
 # ARCHIVE ROUTE: unified handler (review outputs + product outputs)
@@ -2084,6 +2428,12 @@ def handle_archive_event(bucket: str, name: str, generation: str) -> Tuple[str, 
 
           evidence_list STRING,
 
+          -- NEW
+          pos_keywords STRING,
+          neg_keywords STRING,
+          pos_proofs_str STRING,
+          neg_proofs_str STRING,
+
           extracted_at STRING,
           model_name STRING,
           model_version STRING,
@@ -2100,6 +2450,8 @@ def handle_archive_event(bucket: str, name: str, generation: str) -> Tuple[str, 
 
         _load_ndjson_to_table(stg_table, tmp, write_disposition="WRITE_TRUNCATE")
         _merge_product_total_from_staging(stg_table)
+        _update_product_total_counts_and_score_for_stg(stg_table)
+
         client.query(f"DROP TABLE `{stg_table}`").result()
 
         logger.info("ARCHIVE processed product_total rows=%d file=%s", len(rows), name)
@@ -2139,6 +2491,12 @@ def handle_archive_event(bucket: str, name: str, generation: str) -> Tuple[str, 
 
           evidence_list STRING,
 
+          -- NEW
+          pos_keywords STRING,
+          neg_keywords STRING,
+          pos_proofs_str STRING,
+          neg_proofs_str STRING,
+
           extracted_at STRING,
           model_name STRING,
           model_version STRING,
@@ -2155,6 +2513,7 @@ def handle_archive_event(bucket: str, name: str, generation: str) -> Tuple[str, 
 
         _load_ndjson_to_table(stg_table, tmp, write_disposition="WRITE_TRUNCATE")
         _merge_product_daily_from_staging(stg_table)
+        _update_product_daily_counts_and_score_for_stg(stg_table)
 
         # ✅ product_daily 라벨을 style_daily_metrics에 자동으로 붙여넣기
         _merge_style_daily_metrics_with_product_daily_labels_from_stg(stg_table)
@@ -2162,7 +2521,9 @@ def handle_archive_event(bucket: str, name: str, generation: str) -> Tuple[str, 
         client.query(f"DROP TABLE `{stg_table}`").result()
 
         # product_total 제출: 이번 product_daily에서 나온 (brand, product, channel)만 대상으로
-        products = list({(str(r.get("brand_no") or ""), str(r.get("product_no") or ""), str(r.get("channel") or "")) for r in rows})
+        products = list(
+            {(str(r.get("brand_no") or ""), str(r.get("product_no") or ""), str(r.get("channel") or "")) for r in rows}
+        )
         # 제외 대상은 다시 한번 제거
         products = [(b, p, c) for (b, p, c) in products if not _is_excluded_brand_product(b, p)]
 
@@ -2219,6 +2580,7 @@ def handle_archive_event(bucket: str, name: str, generation: str) -> Tuple[str, 
         except Exception as e:
             logger.warning("Failed to DROP temp stg table (non-fatal) table=%s err=%s", stg_table, str(e)[:300])
 
+
 # =========================================================
 # UPLOAD ROUTE: UPLOAD_BUCKET .xlsx -> raw/clean -> batch submit
 # =========================================================
@@ -2253,6 +2615,7 @@ def handle_xlsx_upload_event(bucket: str, name: str, generation: str) -> Tuple[s
     job_name = submit_vertex_batch_job_global(input_uri, name, generation)
 
     return ("DONE", f"BATCH_JOB={job_name}" if job_name else "NO_TARGETS")
+
 
 # -----------------------------
 # CloudEvent entrypoint (single service, two routes)
